@@ -1,0 +1,26 @@
+{
+  "name": "@coralogix/opentelemetry",
+  "version": "1.0.0",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "test": "tsc && npm run lint",
+    "lint": "eslint . --ext .ts",
+    "lint:fix": "npm run lint -- --fix",
+    "build": "tsup src/lib/index.ts --format cjs,esm --clean --sourcemap --dts"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "^1.7.0",
+    "@opentelemetry/sdk-trace-base": "^1.18.1",
+    "@opentelemetry/semantic-conventions": "^1.18.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.8.8",
+    "@typescript-eslint/eslint-plugin": "^6.9.0",
+    "@typescript-eslint/parser": "^6.9.0",
+    "eslint": "^8.52.0",
+    "tsup": "^7.2.0",
+    "typescript": "^5.2.2"
+  }
+}
