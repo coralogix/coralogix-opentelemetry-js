@@ -1,5 +1,5 @@
 name: coralogix-opentelemetry-js
 CX_PRODUCT: tracing
 deployable_type: library
-enabled: false
-lifecycle_status: development
+enabled: true
+lifecycle_status: production
