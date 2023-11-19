@@ -1,1 +1,0 @@
-export {CoralogixTransactionProcessor} from './coralogix-transaction-processor';

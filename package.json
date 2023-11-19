@@ -5,22 +5,26 @@
   "module": "dist/index.mjs",
   "types": "dist/index.d.ts",
   "scripts": {
-    "test": "tsc && npm run lint",
+    "test": "tsc && npm run lint && npm run test:unit",
+    "test:unit": "node --loader tsx --test test/test.ts",
     "lint": "eslint . --ext .ts",
     "lint:fix": "npm run lint -- --fix",
-    "build": "tsup src/lib/index.ts --format cjs,esm --clean --sourcemap --dts"
+    "build": "tsup src/index.ts --format cjs,esm --clean --sourcemap --dts"
   },
   "dependencies": {
     "@opentelemetry/api": "^1.7.0",
-    "@opentelemetry/sdk-trace-base": "^1.18.1",
-    "@opentelemetry/semantic-conventions": "^1.18.1"
+    "@opentelemetry/sdk-trace-base": "^1.18.1"
   },
   "devDependencies": {
+    "@types/lodash": "^4.14.201",
     "@types/node": "^20.8.8",
     "@typescript-eslint/eslint-plugin": "^6.9.0",
     "@typescript-eslint/parser": "^6.9.0",
     "eslint": "^8.52.0",
+    "husky": "^8.0.3",
+    "lodash": "^4.17.21",
     "tsup": "^7.2.0",
+    "tsx": "^4.1.2",
     "typescript": "^5.2.2"
   }
 }

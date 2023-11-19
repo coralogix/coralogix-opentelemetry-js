@@ -14,7 +14,12 @@ module.exports = {
     ],
     "rules": {
         "@typescript-eslint/no-unused-vars": ["error", {"varsIgnorePattern": "^_", "argsIgnorePattern": "^_"}],
-        "@typescript-eslint/naming-convention": "error",
+        "@typescript-eslint/naming-convention": ["error", {
+            "format": ["camelCase", "UPPER_CASE", "PascalCase"],
+            "selector": "variable",
+            "leadingUnderscore": 'allow',
+            'trailingUnderscore': 'allow'
+        }],
         "@typescript-eslint/explicit-module-boundary-types": "error",
         "@typescript-eslint/no-require-imports": "error",
         "@typescript-eslint/prefer-nullish-coalescing": "error",

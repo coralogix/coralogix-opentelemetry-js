@@ -1,0 +1,1 @@
+export {CoralogixAttributes} from './coralogix-attributes';
