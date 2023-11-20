@@ -2,9 +2,7 @@ import {Sampler, SamplingResult} from "@opentelemetry/sdk-trace-base";
 import {buildSamplerFromEnv} from "@opentelemetry/sdk-trace-base/build/esnext/config";
 import {Attributes, Context, createTraceState, Link, SpanKind} from "@opentelemetry/api";
 import * as opentelemetry from "@opentelemetry/api";
-import {CoralogixAttributes} from "../common";
-
-const {TRANSACTION_IDENTIFIER, DISTRIBUTED_TRANSACTION_IDENTIFIER} = CoralogixAttributes;
+import {CoralogixAttributes, CoralogixTraceState} from "../common";
 
 export class CoralogixTransactionSampler implements Sampler {
     // eslint-disable-next-line @typescript-eslint/naming-convention
@@ -19,23 +17,23 @@ export class CoralogixTransactionSampler implements Sampler {
         const spanContext = opentelemetry.trace.getSpanContext(context);
 
         // if distributed transaction exists, use it, if not this is the first span and thus the root of the distributed transaction
-        const distributedTransaction = spanContext?.traceState?.get(DISTRIBUTED_TRANSACTION_IDENTIFIER) ?? spanName;
+        const distributedTransaction = spanContext?.traceState?.get(CoralogixTraceState.DISTRIBUTED_TRANSACTION_IDENTIFIER) ?? spanName;
 
         // if span is remote, then start a new transaction, else try to use existing transaction
         const transaction = spanContext?.isRemote ? spanName :
-            (spanContext?.traceState?.get(TRANSACTION_IDENTIFIER) ?? spanName)
+            (spanContext?.traceState?.get(CoralogixTraceState.TRANSACTION_IDENTIFIER) ?? spanName)
 
         let {attributes: resultAttributes, traceState} = result;
         const {decision} = result;
 
         traceState = (traceState ?? createTraceState())
-            .set(TRANSACTION_IDENTIFIER, transaction)
-            .set(DISTRIBUTED_TRANSACTION_IDENTIFIER, distributedTransaction);
+            .set(CoralogixTraceState.TRANSACTION_IDENTIFIER, transaction)
+            .set(CoralogixTraceState.DISTRIBUTED_TRANSACTION_IDENTIFIER, distributedTransaction);
 
         resultAttributes = {
             ...(resultAttributes ?? {}),
-            [TRANSACTION_IDENTIFIER]: transaction,
-            [DISTRIBUTED_TRANSACTION_IDENTIFIER]: distributedTransaction
+            [CoralogixAttributes.TRANSACTION_IDENTIFIER]: transaction,
+            [CoralogixAttributes.DISTRIBUTED_TRANSACTION_IDENTIFIER]: distributedTransaction
         }
 
         return {
