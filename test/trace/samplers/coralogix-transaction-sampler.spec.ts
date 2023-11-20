@@ -95,9 +95,6 @@ export default describe('CoralogixTransactionSampler', () => {
             context = opentelemetry.trace.setSpan(context, span2);
             const span3 = tracer.startSpan('three', {}, context);
             context = opentelemetry.trace.setSpan(context, span3);
-            span3.end();
-            span2.end();
-            span1.end();
 
             if (span1 instanceof Span && span2 instanceof Span && span3 instanceof Span) {
                 assert.strictEqual(span1.attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER], 'one',
@@ -111,6 +108,9 @@ export default describe('CoralogixTransactionSampler', () => {
                 assert.ok(span2 instanceof Span, 'span2 must be instance of Span');
                 assert.ok(span3 instanceof Span, 'span3 must be instance of Span');
             }
+            span3.end();
+            span2.end();
+            span1.end();
         });
 
         it('propagate transaction attribute even if father is non recording', () => {
@@ -125,9 +125,6 @@ export default describe('CoralogixTransactionSampler', () => {
             context = opentelemetry.trace.setSpan(context, span2);
             const span3 = tracer.startSpan('three', {}, context);
             context = opentelemetry.trace.setSpan(context, span3);
-            span3.end();
-            span2.end();
-            span1.end();
 
             if (!span1.isRecording() && !span2.isRecording() && span3 instanceof Span) {
                 assert.strictEqual(span3.attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER], 'one',
@@ -137,6 +134,9 @@ export default describe('CoralogixTransactionSampler', () => {
                 assert.ok(!span2.isRecording(), 'span2 must no be recording');
                 assert.ok(span3 instanceof Span, 'span3 must be instance of Span');
             }
+            span3.end();
+            span2.end();
+            span1.end();
         });
 
         it('create new transaction after remote span is initiated', () => {
@@ -154,10 +154,6 @@ export default describe('CoralogixTransactionSampler', () => {
             context = opentelemetry.trace.setSpan(context, span3);
             const span4 = tracer.startSpan('four', {}, context);
             context = opentelemetry.trace.setSpan(context, span4);
-            span4.end();
-            span3.end();
-            span2.end();
-            span1.end();
 
             if (span1 instanceof Span && span2 instanceof Span && span3 instanceof Span && span4 instanceof Span) {
                 assert.strictEqual(span1.attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER], 'one',
@@ -174,6 +170,10 @@ export default describe('CoralogixTransactionSampler', () => {
                 assert.ok(span3 instanceof Span, 'span3 must be instance of Span');
                 assert.ok(span4 instanceof Span, 'span4 must be instance of Span');
             }
+            span4.end();
+            span3.end();
+            span2.end();
+            span1.end();
         });
     })
 
@@ -190,9 +190,6 @@ export default describe('CoralogixTransactionSampler', () => {
             context = opentelemetry.trace.setSpan(context, span2);
             const span3 = tracer.startSpan('three', {}, context);
             context = opentelemetry.trace.setSpan(context, span3);
-            span3.end();
-            span2.end();
-            span1.end();
 
             if (span1 instanceof Span && span2 instanceof Span && span3 instanceof Span) {
                 assert.strictEqual(span1.attributes[CoralogixAttributes.DISTRIBUTED_TRANSACTION_IDENTIFIER], 'one',
@@ -206,6 +203,9 @@ export default describe('CoralogixTransactionSampler', () => {
                 assert.ok(span2 instanceof Span, 'span2 must be instance of Span');
                 assert.ok(span3 instanceof Span, 'span3 must be instance of Span');
             }
+            span3.end();
+            span2.end();
+            span1.end();
         });
 
         it('propagate distributed transaction attribute even if father is non recording', () => {
@@ -220,9 +220,6 @@ export default describe('CoralogixTransactionSampler', () => {
             context = opentelemetry.trace.setSpan(context, span2);
             const span3 = tracer.startSpan('three', {}, context);
             context = opentelemetry.trace.setSpan(context, span3);
-            span3.end();
-            span2.end();
-            span1.end();
 
             if (!span1.isRecording() && !span2.isRecording() && span3 instanceof Span) {
                 assert.strictEqual(span3.attributes[CoralogixAttributes.DISTRIBUTED_TRANSACTION_IDENTIFIER], 'one',
@@ -232,6 +229,10 @@ export default describe('CoralogixTransactionSampler', () => {
                 assert.ok(!span2.isRecording(), 'span2 must no be recording');
                 assert.ok(span3 instanceof Span, 'span3 must be instance of Span');
             }
+            span3.end();
+            span2.end();
+            span1.end();
+
         });
 
         it('propagate distributed transaction through remote spans', () => {
@@ -249,10 +250,6 @@ export default describe('CoralogixTransactionSampler', () => {
             context = opentelemetry.trace.setSpan(context, span3);
             const span4 = tracer.startSpan('four', {}, context);
             context = opentelemetry.trace.setSpan(context, span4);
-            span4.end();
-            span3.end();
-            span2.end();
-            span1.end();
 
             if (span1 instanceof Span && span2 instanceof Span && span3 instanceof Span && span4 instanceof Span) {
                 assert.strictEqual(span1.attributes[CoralogixAttributes.DISTRIBUTED_TRANSACTION_IDENTIFIER], 'one',
@@ -269,6 +266,10 @@ export default describe('CoralogixTransactionSampler', () => {
                 assert.ok(span3 instanceof Span, 'span3 must be instance of Span');
                 assert.ok(span4 instanceof Span, 'span4 must be instance of Span');
             }
+            span4.end();
+            span3.end();
+            span2.end();
+            span1.end();
         });
     })
 
