@@ -43,7 +43,7 @@ export class CoralogixTransactionSampler implements Sampler {
                 traceState
             }
         } catch (error) {
-            diag.error('CoralogixTransactionSampler failed, returning original sampler result', error);
+            diag.debug('CoralogixTransactionSampler failed, returning original sampler result', error);
             return result;
         }
     }
