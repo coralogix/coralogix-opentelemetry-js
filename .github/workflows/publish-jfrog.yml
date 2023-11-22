@@ -35,4 +35,4 @@ jobs:
         env:
           ARTIFACTORY_USERNAME: ${{ secrets.JFROG_USER }}
           ARTIFACTORY_PASSWORD: ${{ secrets.JFROG_PASSWORD }}
-      - run: npm publish
+      - run: npm publish --userconfig ~/.npmrc
