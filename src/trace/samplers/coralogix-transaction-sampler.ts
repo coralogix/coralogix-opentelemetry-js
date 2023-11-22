@@ -1,5 +1,4 @@
-import {Sampler, SamplingResult} from "@opentelemetry/sdk-trace-base";
-import {buildSamplerFromEnv} from "@opentelemetry/sdk-trace-base/build/esnext/config";
+import {AlwaysOnSampler, ParentBasedSampler, Sampler, SamplingResult} from "@opentelemetry/sdk-trace-base";
 import {Attributes, Context, createTraceState, diag, Link, SpanKind} from "@opentelemetry/api";
 import * as opentelemetry from "@opentelemetry/api";
 import {CoralogixAttributes, CoralogixTraceState} from "../common";
@@ -9,7 +8,14 @@ export class CoralogixTransactionSampler implements Sampler {
     private readonly baseSampler: Sampler;
 
     constructor(baseSampler?: Sampler) {
-        this.baseSampler = baseSampler ?? buildSamplerFromEnv();
+        if (baseSampler) {
+            this.baseSampler = baseSampler;
+        } else {
+            diag.debug(`CoralogixTransactionSampler: no base sampler specified, defaulting to parent base always on sampler`);
+            this.baseSampler = new ParentBasedSampler({
+                root: new AlwaysOnSampler(),
+            });
+        }
     }
 
     shouldSample(context: Context, traceId: string, spanName: string, spanKind: SpanKind, attributes: Attributes, links: Link[]): SamplingResult {
