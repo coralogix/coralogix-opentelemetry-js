@@ -26,9 +26,12 @@ export class CoralogixTransactionSampler implements Sampler {
             // if distributed transaction exists, use it, if not this is the first span and thus the root of the distributed transaction
             const distributedTransaction = spanContext?.traceState?.get(CoralogixTraceState.DISTRIBUTED_TRANSACTION_IDENTIFIER) ?? spanName;
 
+            const existingTransaction = spanContext?.traceState?.get(CoralogixTraceState.TRANSACTION_IDENTIFIER);
+
             // if span is remote, then start a new transaction, else try to use existing transaction
-            const transaction = spanContext?.isRemote ? spanName :
-                (spanContext?.traceState?.get(CoralogixTraceState.TRANSACTION_IDENTIFIER) ?? spanName)
+            const startsTransaction = existingTransaction === undefined || spanContext?.isRemote;
+
+            const transaction = startsTransaction ? spanName : existingTransaction;
 
             let {attributes: resultAttributes, traceState} = result;
             const {decision} = result;
@@ -40,7 +43,8 @@ export class CoralogixTransactionSampler implements Sampler {
             resultAttributes = {
                 ...(resultAttributes ?? {}),
                 [CoralogixAttributes.TRANSACTION_IDENTIFIER]: transaction,
-                [CoralogixAttributes.DISTRIBUTED_TRANSACTION_IDENTIFIER]: distributedTransaction
+                [CoralogixAttributes.DISTRIBUTED_TRANSACTION_IDENTIFIER]: distributedTransaction,
+                [CoralogixAttributes.TRANSACTION_ROOT]: startsTransaction ?? undefined
             }
 
             return {
