@@ -2,6 +2,7 @@ import {AlwaysOnSampler, ParentBasedSampler, Sampler, SamplingResult} from "@ope
 import {Attributes, Context, createTraceState, diag, Link, SpanKind} from "@opentelemetry/api";
 import * as opentelemetry from "@opentelemetry/api";
 import {CoralogixAttributes, CoralogixTraceState} from "../common";
+import { getRPCMetadata, RPCType } from '@opentelemetry/core';
 
 export class CoralogixTransactionSampler implements Sampler {
     // eslint-disable-next-line @typescript-eslint/naming-convention
@@ -31,7 +32,13 @@ export class CoralogixTransactionSampler implements Sampler {
             // if span is remote, then start a new transaction, else try to use existing transaction
             const startsTransaction = existingTransaction === undefined || spanContext?.isRemote;
 
-            const transaction = startsTransaction ? spanName : existingTransaction;
+            let transaction = startsTransaction ? spanName : existingTransaction;
+            const rpcMeta = getRPCMetadata(context);
+            if(rpcMeta?.route && rpcMeta?.route !== '/' && rpcMeta?.type === RPCType.HTTP) {
+                const parentSpan = rpcMeta.span;
+                transaction = `${existingTransaction ?? 'GET'} ${rpcMeta?.route}`;
+                parentSpan.setAttribute(CoralogixTraceState.TRANSACTION_IDENTIFIER, transaction)
+            }
 
             let {attributes: resultAttributes, traceState} = result;
             const {decision} = result;
