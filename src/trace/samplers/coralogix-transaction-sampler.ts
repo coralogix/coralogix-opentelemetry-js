@@ -59,7 +59,7 @@ export class CoralogixTransactionSampler implements Sampler {
     }
 
     setExpressApp(app: express.Application): void {
-        const routes: any[] = [];
+        const routes: RouteMapping[] = [];
 
         app._router.stack.forEach((middleware: Handler | ILayer) => {
             if (this.isMiddlewareILayer(middleware)) {
@@ -73,7 +73,7 @@ export class CoralogixTransactionSampler implements Sampler {
                 // router middleware
                 const handle = middleware?.handle;
                 const stack = handle?.stack ?? handle?.__original?.stack;
-                stack && stack.forEach((handler: any) => {
+                stack && stack.forEach((handler) => {
                     const route = handler.route;
                     if (route) {
                         routes.push({
