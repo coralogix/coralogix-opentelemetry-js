@@ -51,7 +51,7 @@ export class CoralogixTransactionSampler implements Sampler {
     }
 
     private _isMiddlewareILayer(middleware: Handler | ILayer): middleware is ILayer {
-        return "route" in middleware ? middleware?.route !== undefined : false;
+        return "route" in middleware && !!middleware?.route;
     }
 
 
