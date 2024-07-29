@@ -1,7 +1,7 @@
 # Coralogix Opentelemetry
 
 ## Flows With Express
-To use coralogix flows with express you must use the `addExpressApp`
+To use coralogix flows with express you must use the `setExpressApp`
 function to make sure that the `coralogix sampler` understands
 your routes and endpoints.
 
