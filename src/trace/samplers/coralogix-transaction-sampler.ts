@@ -49,12 +49,12 @@ export class CoralogixTransactionSampler implements Sampler {
         return `${spanName} ${path}`;
     }
 
-    private isMiddlewareILayer(middleware: Handler | ILayer): middleware is ILayer {
+    private _isMiddlewareILayer(middleware: Handler | ILayer): middleware is ILayer {
         return "route" in middleware ? middleware?.route !== undefined : false;
     }
 
 
-    private isMiddlewareHandler(middleware: ILayer | Handler): middleware is Handler {
+    private _isMiddlewareHandler(middleware: ILayer | Handler): middleware is Handler {
         return middleware?.name === 'router';
     }
 
@@ -62,14 +62,14 @@ export class CoralogixTransactionSampler implements Sampler {
         const routes: RouteMapping[] = [];
 
         app._router.stack.forEach((middleware: Handler | ILayer) => {
-            if (this.isMiddlewareILayer(middleware)) {
+            if (this._isMiddlewareILayer(middleware)) {
                 // routes registered directly on the app
                 if (middleware.route?.path)
                     routes.push({
                         path: middleware.route.path,
                         regex: middleware.regexp,
                     });
-            } else if (this.isMiddlewareHandler(middleware)) {
+            } else if (this._isMiddlewareHandler(middleware)) {
                 // router middleware
                 const handle = middleware?.handle;
                 const stack = handle?.stack ?? handle?.__original?.stack;
