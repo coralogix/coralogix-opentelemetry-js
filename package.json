@@ -9,7 +9,7 @@
   ],
   "scripts": {
     "test": "tsc && npm run lint && npm run test:unit",
-    "test:unit": "node --loader tsx --test test/test.ts",
+    "test:unit": "node --experimental-loader tsx --test test/test.ts",
     "lint": "eslint . --ext .ts",
     "lint:fix": "npm run lint -- --fix",
     "build": "tsup src/index.ts --format cjs,esm --clean --sourcemap --dts"
