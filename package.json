@@ -16,7 +16,8 @@
   },
   "dependencies": {
     "@opentelemetry/api": "^1.7.0",
-    "@opentelemetry/sdk-trace-base": "^1.18.1"
+    "@opentelemetry/sdk-trace-base": "^1.18.1",
+    "@opentelemetry/semantic-conventions": "^1.25.1"
   },
   "devDependencies": {
     "@types/express": "^4.17.21",

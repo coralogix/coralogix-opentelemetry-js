@@ -4,6 +4,7 @@ import * as opentelemetry from "@opentelemetry/api";
 import {CoralogixAttributes, CoralogixTraceState} from "../common";
 import type express from 'express';
 import {ILayer} from "express-serve-static-core";
+import {SEMATTRS_HTTP_TARGET} from "@opentelemetry/semantic-conventions";
 
 export interface RouteMapping {
     regex: RegExp,
@@ -93,7 +94,7 @@ export class CoralogixTransactionSampler implements Sampler {
         try {
             const spanContext = opentelemetry.trace.getSpanContext(context);
 
-            const httpTarget = attributes?.['http.target']?.toString();
+            const httpTarget = attributes?.[SEMATTRS_HTTP_TARGET]?.toString();
             const path = this._getPathFromRoutes(httpTarget ?? '');
 
             const transactionName = path ? this._buildTransactionNameFromExpressPath(path, spanName) : spanName;
