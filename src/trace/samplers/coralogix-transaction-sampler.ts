@@ -59,8 +59,10 @@ export class CoralogixTransactionSampler implements Sampler {
     }
 
     setExpressApp(app: express.Application): void {
-        const routes: RouteMapping[] = [];
-
+        if (!app._router || !app._router.stack) {
+            return;
+        }
+        const routes: RouteMapping[] = this.routes;
         app._router.stack.forEach((middleware: Handler | ILayer) => {
             if (this._isMiddlewareILayer(middleware)) {
                 // routes registered directly on the app
@@ -84,8 +86,6 @@ export class CoralogixTransactionSampler implements Sampler {
                 });
             }
         });
-
-        this.routes = [...this.routes, ...routes];
     }
 
     shouldSample(context: Context, traceId: string, spanName: string, spanKind: SpanKind, attributes: Attributes, links: Link[]): SamplingResult {
