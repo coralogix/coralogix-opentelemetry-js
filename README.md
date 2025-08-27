@@ -27,6 +27,11 @@ To use Coralogix flows with express you must use the `setExpressApp` function to
 Example:
 
 ```javascript
+import { BasicTracerProvider } from "@opentelemetry/sdk-trace-base";
+import { CoralogixTransactionSampler } from '@coralogix/opentelemetry';
+import { Resource } from "@opentelemetry/resources";
+import { SemanticResourceAttributes } from "@opentelemetry/semantic-conventions";
+
 const sampler = new CoralogixTransactionSampler();
 
 const tracerProvider = new BasicTracerProvider({
@@ -35,8 +40,10 @@ const tracerProvider = new BasicTracerProvider({
     }),
     sampler
 });
+
 import express from "express";
-import router from "./router";
+
+const router = express.Router()
 
 const app = express();
 app.use('/', router);
