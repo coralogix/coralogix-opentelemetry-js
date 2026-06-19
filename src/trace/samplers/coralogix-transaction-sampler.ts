@@ -7,13 +7,14 @@ import {ILayer} from "express-serve-static-core";
 import {SEMATTRS_HTTP_TARGET} from "@opentelemetry/semantic-conventions";
 
 export interface RouteMapping {
-    regex: RegExp,
+    matches: (path: string) => boolean,
     path: string,
 }
 
 interface Stack {
     route: { path: string },
-    regexp: RegExp
+    regexp?: RegExp,
+    match?: (path: string) => boolean,
 }
 
 interface Handle {
@@ -24,6 +25,10 @@ interface Handle {
 interface Handler {
     handle: Handle,
     name?: string,
+}
+
+interface RouterLike {
+    stack: (Handler | ILayer)[],
 }
 
 export class CoralogixTransactionSampler implements Sampler {
@@ -43,7 +48,15 @@ export class CoralogixTransactionSampler implements Sampler {
 
 
     private _getPathFromRoutes(path: string): string | undefined {
-        return this.routes.find(route => route.regex.test(path))?.path;
+        const pathname = path.replace(/[?#].*$/, '');
+        return this.routes.find(route => route.matches(pathname))?.path;
+    }
+
+    // Express 4 layers have `regexp`; Express 5 (router@2.x) replaced it with `match(path)`.
+    private _buildMatcher(layer: { regexp?: RegExp, match?: (path: string) => boolean }): (path: string) => boolean {
+        if (layer.regexp) return (p) => layer.regexp!.test(p);
+        if (layer.match) return layer.match.bind(layer);
+        return () => false;
     }
 
     private _buildTransactionNameFromExpressPath(path: string, spanName: string): string {
@@ -61,13 +74,21 @@ export class CoralogixTransactionSampler implements Sampler {
     setExpressApp(app: express.Application): void {
         const routes: RouteMapping[] = [];
 
-        app._router.stack.forEach((middleware: Handler | ILayer) => {
+        // @types/express v4 types app.router as a deprecated string; cast to reach both v4/v5 shapes.
+        const compat = app as unknown as { router?: RouterLike; _router?: RouterLike };
+        const expressRouter = compat.router ?? compat._router;
+        if (!expressRouter?.stack) {
+            diag.warn('CoralogixTransactionSampler.setExpressApp: could not find the Express router stack, route templates will not be resolved');
+            return;
+        }
+
+        expressRouter.stack.forEach((middleware: Handler | ILayer) => {
             if (this._isMiddlewareILayer(middleware)) {
                 // routes registered directly on the app
                 if (middleware.route?.path)
                     routes.push({
                         path: middleware.route.path,
-                        regex: middleware.regexp,
+                        matches: this._buildMatcher(middleware),
                     });
             } else if (this._isMiddlewareHandler(middleware)) {
                 // router middleware
@@ -78,7 +99,7 @@ export class CoralogixTransactionSampler implements Sampler {
                     if (route) {
                         routes.push({
                             path: route.path,
-                            regex: handler.regexp,
+                            matches: this._buildMatcher(handler),
                         });
                     }
                 });
