@@ -30,6 +30,16 @@ jobs:
           registry-url: https://registry.npmjs.org/
       - run: npm ci
       - run: npm run build
+      - name: Verify package version matches release tag
+        if: github.event_name == 'release'
+        run: |
+          TAG_VERSION="${{ github.event.release.tag_name }}"
+          TAG_VERSION="${TAG_VERSION#v}"
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "package.json version ($PKG_VERSION) does not match release tag (v$TAG_VERSION)"
+            exit 1
+          fi
       - run: npm prune dev
       - run: curl -u "${ARTIFACTORY_USERNAME}:${ARTIFACTORY_PASSWORD}" https://cgx.jfrog.io/artifactory/api/npm/internal.npm.coralogix.net/auth/coralogix | tee ~/.npmrc
         env:
