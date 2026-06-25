@@ -28,6 +28,9 @@ jobs:
         with:
           node-version: 18
           registry-url: https://registry.npmjs.org/
+          scope: '@coralogix'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - run: npm ci
       - run: npm run build
       - name: Verify package version matches release tag
@@ -42,3 +45,5 @@ jobs:
           fi
       - run: npm prune dev
       - run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
