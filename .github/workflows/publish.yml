@@ -1,5 +1,6 @@
-# This workflow will run tests using node and then publish a package to GitHub Packages when a release is created
-# For more information see: https://docs.github.com/en/actions/publishing-packages/publishing-nodejs-packages
+# Publish to npm using Trusted Publishing (OIDC).
+# Configure the trusted publisher on npmjs.com for workflow file: publish.yml
+# https://docs.npmjs.com/trusted-publishers/
 
 name: NPM publish
 
@@ -12,8 +13,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-node@v3
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 18
       - run: npm ci
@@ -22,12 +23,16 @@ jobs:
   publish-npm:
     needs: test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-node@v3
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: 18
-          registry-url: https://registry.npmjs.org/
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          scope: '@coralogix'
       - run: npm ci
       - run: npm run build
       - name: Verify package version matches release tag
@@ -41,4 +46,7 @@ jobs:
             exit 1
           fi
       - run: npm prune dev
-      - run: npm publish --access public
+      - name: Publish to npm via OIDC
+        run: |
+          unset NODE_AUTH_TOKEN
+          npm publish --access public
