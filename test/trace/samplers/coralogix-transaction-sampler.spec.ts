@@ -5,13 +5,37 @@ import {Attributes, Context, createTraceState, Link, ROOT_CONTEXT, SpanKind, Tra
 import assert from "node:assert"
 import {
     BasicTracerProvider,
+    InMemorySpanExporter,
     Sampler,
     SamplingDecision,
     SamplingResult,
-    Span,
+    SimpleSpanProcessor,
 } from "@opentelemetry/sdk-trace-base";
 import {CoralogixAttributes} from "../../../src/trace/common";
 import {isMatch} from 'lodash';
+
+const NON_SAMPLED_ATTRIBUTE_NAME = 'non_sampled';
+
+// Builds a tracer whose spans are collected through the real SDK export pipeline. This lets the
+// tests assert on a span's recorded attributes via the public `ReadableSpan` contract
+// (`InMemorySpanExporter.getFinishedSpans()`) instead of reaching into the span implementation.
+function createTestTracer(sampler: Sampler = new CoralogixTransactionSampler()) {
+    const exporter = new InMemorySpanExporter();
+    const provider = new BasicTracerProvider({
+        sampler,
+        spanProcessors: [new SimpleSpanProcessor(exporter)],
+    });
+    return {tracer: provider.getTracer('default'), exporter};
+}
+
+// Resolves the exported span that corresponds to `span` and returns its recorded attributes.
+// Only sampled spans are exported, which is exactly the set of spans these tests inspect.
+function exportedAttributes(exporter: InMemorySpanExporter, span: opentelemetry.Span): Attributes {
+    const {spanId} = span.spanContext();
+    const finished = exporter.getFinishedSpans().find(s => s.spanContext().spanId === spanId);
+    assert.ok(finished, `expected span ${spanId} to have been exported`);
+    return finished.attributes;
+}
 
 export default describe('CoralogixTransactionSampler', () => {
     let context: Context = ROOT_CONTEXT;
@@ -84,10 +108,7 @@ export default describe('CoralogixTransactionSampler', () => {
 
     describe('transaction attribute', () => {
         it('propagate transaction through spans', () => {
-            const tracerProvider = new BasicTracerProvider({
-                sampler: new CoralogixTransactionSampler()
-            });
-            const tracer = tracerProvider.getTracer('default');
+            const {tracer, exporter} = createTestTracer();
 
             const span1 = tracer.startSpan('one', {}, context);
             context = opentelemetry.trace.setSpan(context, span1);
@@ -96,28 +117,20 @@ export default describe('CoralogixTransactionSampler', () => {
             const span3 = tracer.startSpan('three', {}, context);
             context = opentelemetry.trace.setSpan(context, span3);
 
-            if (span1 instanceof Span && span2 instanceof Span && span3 instanceof Span) {
-                assert.strictEqual(span1.attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER], 'one',
-                    'span1 must created a transaction attribute');
-                assert.strictEqual(span1.attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER], 'one',
-                    'span2 must have transaction attribute from parent');
-                assert.strictEqual(span3.attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER], 'one',
-                    'span3 must have transaction attribute from parent');
-            } else {
-                assert.ok(span1 instanceof Span, 'span1 must be instance of Span');
-                assert.ok(span2 instanceof Span, 'span2 must be instance of Span');
-                assert.ok(span3 instanceof Span, 'span3 must be instance of Span');
-            }
             span3.end();
             span2.end();
             span1.end();
+
+            assert.strictEqual(exportedAttributes(exporter, span1)[CoralogixAttributes.TRANSACTION_IDENTIFIER], 'one',
+                'span1 must create a transaction attribute');
+            assert.strictEqual(exportedAttributes(exporter, span2)[CoralogixAttributes.TRANSACTION_IDENTIFIER], 'one',
+                'span2 must have transaction attribute from parent');
+            assert.strictEqual(exportedAttributes(exporter, span3)[CoralogixAttributes.TRANSACTION_IDENTIFIER], 'one',
+                'span3 must have transaction attribute from parent');
         });
 
         it('propagate transaction attribute even if father is non recording', () => {
-            const tracerProvider = new BasicTracerProvider({
-                sampler: new CoralogixTransactionSampler(new TestAttributeSamplingSampler())
-            });
-            const tracer = tracerProvider.getTracer('default');
+            const {tracer, exporter} = createTestTracer(new CoralogixTransactionSampler(new TestAttributeSamplingSampler()));
 
             const span1 = tracer.startSpan('one', {attributes: {[NON_SAMPLED_ATTRIBUTE_NAME]: 'true'}}, context);
             context = opentelemetry.trace.setSpan(context, span1);
@@ -126,24 +139,18 @@ export default describe('CoralogixTransactionSampler', () => {
             const span3 = tracer.startSpan('three', {}, context);
             context = opentelemetry.trace.setSpan(context, span3);
 
-            if (!span1.isRecording() && !span2.isRecording() && span3 instanceof Span) {
-                assert.strictEqual(span3.attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER], 'one',
-                    'span3 must have transaction attribute from parent');
-            } else {
-                assert.ok(!span1.isRecording(), 'span1 must no be recording');
-                assert.ok(!span2.isRecording(), 'span2 must no be recording');
-                assert.ok(span3 instanceof Span, 'span3 must be instance of Span');
-            }
             span3.end();
             span2.end();
             span1.end();
+
+            assert.ok(!span1.isRecording(), 'span1 must not be recording');
+            assert.ok(!span2.isRecording(), 'span2 must not be recording');
+            assert.strictEqual(exportedAttributes(exporter, span3)[CoralogixAttributes.TRANSACTION_IDENTIFIER], 'one',
+                'span3 must have transaction attribute from parent');
         });
 
         it('create new transaction after remote span is initiated', () => {
-            const tracerProvider = new BasicTracerProvider({
-                sampler: new CoralogixTransactionSampler()
-            });
-            const tracer = tracerProvider.getTracer('default');
+            const {tracer, exporter} = createTestTracer();
 
             const span1 = tracer.startSpan('one', {}, context);
             context = opentelemetry.trace.setSpan(context, span1);
@@ -155,34 +162,25 @@ export default describe('CoralogixTransactionSampler', () => {
             const span4 = tracer.startSpan('four', {}, context);
             context = opentelemetry.trace.setSpan(context, span4);
 
-            if (span1 instanceof Span && span2 instanceof Span && span3 instanceof Span && span4 instanceof Span) {
-                assert.strictEqual(span1.attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER], 'one',
-                    'span1 must created a transaction attribute');
-                assert.strictEqual(span1.attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER], 'one',
-                    'span2 must have transaction attribute from parent');
-                assert.strictEqual(span3.attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER], 'three',
-                    'span3 must created a transaction attribute');
-                assert.strictEqual(span4.attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER], 'three',
-                    'span4 must have transaction attribute from parent');
-            } else {
-                assert.ok(span1 instanceof Span, 'span1 must be instance of Span');
-                assert.ok(span2 instanceof Span, 'span2 must be instance of Span');
-                assert.ok(span3 instanceof Span, 'span3 must be instance of Span');
-                assert.ok(span4 instanceof Span, 'span4 must be instance of Span');
-            }
             span4.end();
             span3.end();
             span2.end();
             span1.end();
+
+            assert.strictEqual(exportedAttributes(exporter, span1)[CoralogixAttributes.TRANSACTION_IDENTIFIER], 'one',
+                'span1 must create a transaction attribute');
+            assert.strictEqual(exportedAttributes(exporter, span2)[CoralogixAttributes.TRANSACTION_IDENTIFIER], 'one',
+                'span2 must have transaction attribute from parent');
+            assert.strictEqual(exportedAttributes(exporter, span3)[CoralogixAttributes.TRANSACTION_IDENTIFIER], 'three',
+                'span3 must create a new transaction attribute after the remote span');
+            assert.strictEqual(exportedAttributes(exporter, span4)[CoralogixAttributes.TRANSACTION_IDENTIFIER], 'three',
+                'span4 must have transaction attribute from parent');
         });
     })
 
     describe('distributed transaction attribute', () => {
         it('propagate distributed transaction through spans', () => {
-            const tracerProvider = new BasicTracerProvider({
-                sampler: new CoralogixTransactionSampler()
-            });
-            const tracer = tracerProvider.getTracer('default');
+            const {tracer, exporter} = createTestTracer();
 
             const span1 = tracer.startSpan('one', {}, context);
             context = opentelemetry.trace.setSpan(context, span1);
@@ -191,28 +189,20 @@ export default describe('CoralogixTransactionSampler', () => {
             const span3 = tracer.startSpan('three', {}, context);
             context = opentelemetry.trace.setSpan(context, span3);
 
-            if (span1 instanceof Span && span2 instanceof Span && span3 instanceof Span) {
-                assert.strictEqual(span1.attributes[CoralogixAttributes.DISTRIBUTED_TRANSACTION_IDENTIFIER], 'one',
-                    'span1 must created a distributed transaction attribute');
-                assert.strictEqual(span1.attributes[CoralogixAttributes.DISTRIBUTED_TRANSACTION_IDENTIFIER], 'one',
-                    'span2 must have distributed transaction attribute from parent');
-                assert.strictEqual(span3.attributes[CoralogixAttributes.DISTRIBUTED_TRANSACTION_IDENTIFIER], 'one',
-                    'span3 must have distributed transaction attribute from parent');
-            } else {
-                assert.ok(span1 instanceof Span, 'span1 must be instance of Span');
-                assert.ok(span2 instanceof Span, 'span2 must be instance of Span');
-                assert.ok(span3 instanceof Span, 'span3 must be instance of Span');
-            }
             span3.end();
             span2.end();
             span1.end();
+
+            assert.strictEqual(exportedAttributes(exporter, span1)[CoralogixAttributes.DISTRIBUTED_TRANSACTION_IDENTIFIER], 'one',
+                'span1 must create a distributed transaction attribute');
+            assert.strictEqual(exportedAttributes(exporter, span2)[CoralogixAttributes.DISTRIBUTED_TRANSACTION_IDENTIFIER], 'one',
+                'span2 must have distributed transaction attribute from parent');
+            assert.strictEqual(exportedAttributes(exporter, span3)[CoralogixAttributes.DISTRIBUTED_TRANSACTION_IDENTIFIER], 'one',
+                'span3 must have distributed transaction attribute from parent');
         });
 
         it('propagate distributed transaction attribute even if father is non recording', () => {
-            const tracerProvider = new BasicTracerProvider({
-                sampler: new CoralogixTransactionSampler(new TestAttributeSamplingSampler())
-            });
-            const tracer = tracerProvider.getTracer('default');
+            const {tracer, exporter} = createTestTracer(new CoralogixTransactionSampler(new TestAttributeSamplingSampler()));
 
             const span1 = tracer.startSpan('one', {attributes: {[NON_SAMPLED_ATTRIBUTE_NAME]: 'true'}}, context);
             context = opentelemetry.trace.setSpan(context, span1);
@@ -221,25 +211,18 @@ export default describe('CoralogixTransactionSampler', () => {
             const span3 = tracer.startSpan('three', {}, context);
             context = opentelemetry.trace.setSpan(context, span3);
 
-            if (!span1.isRecording() && !span2.isRecording() && span3 instanceof Span) {
-                assert.strictEqual(span3.attributes[CoralogixAttributes.DISTRIBUTED_TRANSACTION_IDENTIFIER], 'one',
-                    'span3 must have distributed transaction attribute from parent');
-            } else {
-                assert.ok(!span1.isRecording(), 'span1 must no be recording');
-                assert.ok(!span2.isRecording(), 'span2 must no be recording');
-                assert.ok(span3 instanceof Span, 'span3 must be instance of Span');
-            }
             span3.end();
             span2.end();
             span1.end();
 
+            assert.ok(!span1.isRecording(), 'span1 must not be recording');
+            assert.ok(!span2.isRecording(), 'span2 must not be recording');
+            assert.strictEqual(exportedAttributes(exporter, span3)[CoralogixAttributes.DISTRIBUTED_TRANSACTION_IDENTIFIER], 'one',
+                'span3 must have distributed transaction attribute from parent');
         });
 
         it('propagate distributed transaction through remote spans', () => {
-            const tracerProvider = new BasicTracerProvider({
-                sampler: new CoralogixTransactionSampler()
-            });
-            const tracer = tracerProvider.getTracer('default');
+            const {tracer, exporter} = createTestTracer();
 
             const span1 = tracer.startSpan('one', {}, context);
             context = opentelemetry.trace.setSpan(context, span1);
@@ -251,34 +234,25 @@ export default describe('CoralogixTransactionSampler', () => {
             const span4 = tracer.startSpan('four', {}, context);
             context = opentelemetry.trace.setSpan(context, span4);
 
-            if (span1 instanceof Span && span2 instanceof Span && span3 instanceof Span && span4 instanceof Span) {
-                assert.strictEqual(span1.attributes[CoralogixAttributes.DISTRIBUTED_TRANSACTION_IDENTIFIER], 'one',
-                    'span1 must created a transaction attribute');
-                assert.strictEqual(span1.attributes[CoralogixAttributes.DISTRIBUTED_TRANSACTION_IDENTIFIER], 'one',
-                    'span2 must have distributed transaction attribute from parent');
-                assert.strictEqual(span3.attributes[CoralogixAttributes.DISTRIBUTED_TRANSACTION_IDENTIFIER], 'one',
-                    'span2 must have distributed transaction attribute from parent');
-                assert.strictEqual(span4.attributes[CoralogixAttributes.DISTRIBUTED_TRANSACTION_IDENTIFIER], 'one',
-                    'span4 must have distributed transaction attribute from parent');
-            } else {
-                assert.ok(span1 instanceof Span, 'span1 must be instance of Span');
-                assert.ok(span2 instanceof Span, 'span2 must be instance of Span');
-                assert.ok(span3 instanceof Span, 'span3 must be instance of Span');
-                assert.ok(span4 instanceof Span, 'span4 must be instance of Span');
-            }
             span4.end();
             span3.end();
             span2.end();
             span1.end();
+
+            assert.strictEqual(exportedAttributes(exporter, span1)[CoralogixAttributes.DISTRIBUTED_TRANSACTION_IDENTIFIER], 'one',
+                'span1 must create a distributed transaction attribute');
+            assert.strictEqual(exportedAttributes(exporter, span2)[CoralogixAttributes.DISTRIBUTED_TRANSACTION_IDENTIFIER], 'one',
+                'span2 must have distributed transaction attribute from parent');
+            assert.strictEqual(exportedAttributes(exporter, span3)[CoralogixAttributes.DISTRIBUTED_TRANSACTION_IDENTIFIER], 'one',
+                'span3 must keep the distributed transaction attribute across the remote span');
+            assert.strictEqual(exportedAttributes(exporter, span4)[CoralogixAttributes.DISTRIBUTED_TRANSACTION_IDENTIFIER], 'one',
+                'span4 must have distributed transaction attribute from parent');
         });
     })
 
     describe('transaction root attribute', () => {
         it('add transaction root attribute to creator of transaction', () => {
-            const tracerProvider = new BasicTracerProvider({
-                sampler: new CoralogixTransactionSampler()
-            });
-            const tracer = tracerProvider.getTracer('default');
+            const {tracer, exporter} = createTestTracer();
 
             const span1 = tracer.startSpan('one', {}, context);
             context = opentelemetry.trace.setSpan(context, span1);
@@ -287,28 +261,20 @@ export default describe('CoralogixTransactionSampler', () => {
             const span3 = tracer.startSpan('three', {}, context);
             context = opentelemetry.trace.setSpan(context, span3);
 
-            if (span1 instanceof Span && span2 instanceof Span && span3 instanceof Span) {
-                assert.strictEqual(span1.attributes[CoralogixAttributes.TRANSACTION_ROOT], true,
-                    'span1 must have transaction root');
-                assert.ok(!(CoralogixAttributes.TRANSACTION_ROOT in span2.attributes),
-                    'span2 must not have transaction root');
-                assert.ok(!(CoralogixAttributes.TRANSACTION_ROOT in span3.attributes),
-                    'span3 must not have transaction root');
-            } else {
-                assert.ok(span1 instanceof Span, 'span1 must be instance of Span');
-                assert.ok(span2 instanceof Span, 'span2 must be instance of Span');
-                assert.ok(span3 instanceof Span, 'span3 must be instance of Span');
-            }
             span3.end();
             span2.end();
             span1.end();
+
+            assert.strictEqual(exportedAttributes(exporter, span1)[CoralogixAttributes.TRANSACTION_ROOT], true,
+                'span1 must have transaction root');
+            assert.ok(!(CoralogixAttributes.TRANSACTION_ROOT in exportedAttributes(exporter, span2)),
+                'span2 must not have transaction root');
+            assert.ok(!(CoralogixAttributes.TRANSACTION_ROOT in exportedAttributes(exporter, span3)),
+                'span3 must not have transaction root');
         });
 
         it('add transaction root attribute span after remote', () => {
-            const tracerProvider = new BasicTracerProvider({
-                sampler: new CoralogixTransactionSampler()
-            });
-            const tracer = tracerProvider.getTracer('default');
+            const {tracer, exporter} = createTestTracer();
 
             const span1 = tracer.startSpan('one', {}, context);
             context = opentelemetry.trace.setSpan(context, span1);
@@ -320,53 +286,38 @@ export default describe('CoralogixTransactionSampler', () => {
             const span4 = tracer.startSpan('four', {}, context);
             context = opentelemetry.trace.setSpan(context, span4);
 
-            if (span1 instanceof Span && span2 instanceof Span && span3 instanceof Span && span4 instanceof Span) {
-                assert.strictEqual(span1.attributes[CoralogixAttributes.TRANSACTION_ROOT], true,
-                    'span1 must have transaction root');
-                assert.ok(!(CoralogixAttributes.TRANSACTION_ROOT in span2.attributes),
-                    'span2 must not have transaction root');
-                assert.strictEqual(span3.attributes[CoralogixAttributes.TRANSACTION_ROOT], true,
-                    'span3 must have transaction root');
-                assert.ok(!(CoralogixAttributes.TRANSACTION_ROOT in span4.attributes),
-                    'span4 must not have transaction root');
-            } else {
-                assert.ok(span1 instanceof Span, 'span1 must be instance of Span');
-                assert.ok(span2 instanceof Span, 'span2 must be instance of Span');
-                assert.ok(span3 instanceof Span, 'span3 must be instance of Span');
-                assert.ok(span4 instanceof Span, 'span4 must be instance of Span');
-            }
             span4.end();
             span3.end();
             span2.end();
             span1.end();
+
+            assert.strictEqual(exportedAttributes(exporter, span1)[CoralogixAttributes.TRANSACTION_ROOT], true,
+                'span1 must have transaction root');
+            assert.ok(!(CoralogixAttributes.TRANSACTION_ROOT in exportedAttributes(exporter, span2)),
+                'span2 must not have transaction root');
+            assert.strictEqual(exportedAttributes(exporter, span3)[CoralogixAttributes.TRANSACTION_ROOT], true,
+                'span3 must have transaction root');
+            assert.ok(!(CoralogixAttributes.TRANSACTION_ROOT in exportedAttributes(exporter, span4)),
+                'span4 must not have transaction root');
         });
 
         it('span with same name as transaction span should not be root transaction', () => {
-            const tracerProvider = new BasicTracerProvider({
-                sampler: new CoralogixTransactionSampler()
-            });
-            const tracer = tracerProvider.getTracer('default');
+            const {tracer, exporter} = createTestTracer();
 
             const span1 = tracer.startSpan('one', {}, context);
             context = opentelemetry.trace.setSpan(context, span1);
             const span2 = tracer.startSpan('one', {}, context);
             context = opentelemetry.trace.setSpan(context, span2);
 
-            if (span1 instanceof Span && span2 instanceof Span) {
-                assert.strictEqual(span1.attributes[CoralogixAttributes.TRANSACTION_ROOT], true,
-                    'span1 must have transaction root');
-                assert.ok(!(CoralogixAttributes.TRANSACTION_ROOT in span2.attributes),
-                    'span1 must not have transaction root');
-            } else {
-                assert.ok(span1 instanceof Span, 'span1 must be instance of Span');
-                assert.ok(span2 instanceof Span, 'span2 must be instance of Span');
-            }
             span2.end();
             span1.end();
+
+            assert.strictEqual(exportedAttributes(exporter, span1)[CoralogixAttributes.TRANSACTION_ROOT], true,
+                'span1 must have transaction root');
+            assert.ok(!(CoralogixAttributes.TRANSACTION_ROOT in exportedAttributes(exporter, span2)),
+                'span2 must not have transaction root');
         });
     })
-
-    const NON_SAMPLED_ATTRIBUTE_NAME = 'non_sampled';
 
     class TestAttributeSamplingSampler implements Sampler {
 

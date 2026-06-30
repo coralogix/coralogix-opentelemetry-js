@@ -1,6 +1,6 @@
 {
   "name": "@coralogix/opentelemetry",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
   "types": "dist/index.d.ts",
@@ -20,7 +20,7 @@
   },
   "dependencies": {
     "@opentelemetry/api": "^1.7.0",
-    "@opentelemetry/sdk-trace-base": "^1.18.1",
+    "@opentelemetry/sdk-trace-base": "^2.8.0",
     "@opentelemetry/semantic-conventions": "^1.25.1"
   },
   "devDependencies": {
