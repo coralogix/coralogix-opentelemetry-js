@@ -81,8 +81,11 @@ export class CoralogixTransactionSampler implements Sampler {
         const routes: RouteMapping[] = [];
 
         // @types/express v4 types app.router as a deprecated string; cast to reach both v4/v5 shapes.
+        // Read `_router` first: on Express 4 it holds the router stack, while `app.router`
+        // is a getter that THROWS ("'app.router' is deprecated!"). On Express 5 `_router`
+        // is undefined, so we fall back to the public `app.router` getter.
         const compat = app as unknown as { router?: RouterLike; _router?: RouterLike };
-        const expressRouter = compat.router ?? compat._router;
+        const expressRouter = compat._router ?? compat.router;
         if (!expressRouter?.stack) {
             diag.warn('CoralogixTransactionSampler.setExpressApp: could not find the Express router stack, route templates will not be resolved');
             return;
