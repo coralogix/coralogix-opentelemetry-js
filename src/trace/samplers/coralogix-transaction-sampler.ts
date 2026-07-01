@@ -3,7 +3,6 @@ import {Attributes, Context, createTraceState, diag, Link, SpanKind} from "@open
 import * as opentelemetry from "@opentelemetry/api";
 import {CoralogixAttributes, CoralogixTraceState} from "../common";
 import type express from 'express';
-import {ILayer} from "express-serve-static-core";
 import {ATTR_URL_PATH} from "@opentelemetry/semantic-conventions";
 
 // `http.target` is the legacy (pre-stability) HTTP attribute. It was removed from the stable
@@ -17,29 +16,44 @@ export interface RouteMapping {
     path: string,
 }
 
-interface Stack {
-    route: { path: string },
-    regexp?: RegExp,
-    match?: (path: string) => boolean,
+interface RegExpLike extends RegExp {
+    fast_slash?: boolean;
+}
+
+interface PathMatch {
+    path: string;
+    params?: Record<string, unknown>;
+}
+
+interface Layer {
+    name?: string;
+    route?: { path: string };
+    handle?: Handle;
+    regexp?: RegExpLike;
+    keys?: { name: string | number }[];
+    matchers?: ((path: string) => PathMatch | false)[];
+    match?: (path: string) => unknown;
+    slash?: boolean;
 }
 
 interface Handle {
-    stack?: Stack[],
-    __original?: { stack: Stack[] },
-}
-
-interface Handler {
-    handle: Handle,
-    name?: string,
+    stack?: Layer[];
+    __original?: { stack: Layer[] };
 }
 
 interface RouterLike {
-    stack: (Handler | ILayer)[],
+    stack: Layer[];
+}
+
+interface RouteChain {
+    mounts: Layer[];
+    leaf: Layer;
+    leafPath: string;
 }
 
 export class CoralogixTransactionSampler implements Sampler {
     private readonly baseSampler: Sampler;
-    private routes: RouteMapping[] = [];
+    private routeChains: RouteChain[] = [];
 
     constructor(baseSampler?: Sampler) {
         if (baseSampler) {
@@ -55,13 +69,21 @@ export class CoralogixTransactionSampler implements Sampler {
 
     private _getPathFromRoutes(path: string): string | undefined {
         const pathname = path.replace(/[?#].*$/, '');
-        return this.routes.find(route => route.matches(pathname))?.path;
+        for (const chain of this.routeChains) {
+            const resolved = this._resolveChain(chain, pathname);
+            if (resolved !== undefined) return resolved;
+        }
+        return undefined;
     }
 
-    // Express 4 layers have `regexp`; Express 5 (router@2.x) replaced it with `match(path)`.
-    private _buildMatcher(layer: { regexp?: RegExp, match?: (path: string) => boolean }): (path: string) => boolean {
+    // Express 4 layers have `regexp`; Express 5 (router@2.x) replaced it with `match(path)`
+    // which returns a match object (or false) rather than a boolean.
+    private _buildMatcher(layer: Layer): (path: string) => boolean {
         if (layer.regexp) return (p) => layer.regexp!.test(p);
-        if (layer.match) return layer.match.bind(layer);
+        if (layer.match) {
+            const match = layer.match.bind(layer);
+            return (p) => !!match(p);
+        }
         return () => false;
     }
 
@@ -69,17 +91,85 @@ export class CoralogixTransactionSampler implements Sampler {
         return `${spanName} ${path}`;
     }
 
-    private _isMiddlewareILayer(middleware: Handler | ILayer): middleware is ILayer {
-        return "route" in middleware && !!middleware?.route;
+    private _isRouterLayer(layer: Layer): boolean {
+        return layer.name === 'router' && !!(layer.handle?.stack ?? layer.handle?.__original?.stack);
     }
 
-    private _isMiddlewareHandler(middleware: ILayer | Handler): middleware is Handler {
-        return middleware?.name === 'router';
+    private _collectChains(stack: Layer[], mounts: Layer[], out: RouteChain[]): void {
+        for (const layer of stack) {
+            if (layer.route?.path !== undefined) {
+                out.push({mounts: mounts.slice(), leaf: layer, leafPath: layer.route.path});
+            } else if (this._isRouterLayer(layer)) {
+                const inner = layer.handle?.stack ?? layer.handle?.__original?.stack;
+                if (inner) this._collectChains(inner, mounts.concat(layer), out);
+            }
+        }
+    }
+
+    // Rebuild a route template segment by substituting concrete param values back to `:name`,
+    // e.g. matched `/v/2` with params {ver: '2'} becomes `/v/:ver`.
+    private _templatizeParams(matchedPath: string, params?: Record<string, unknown>): string {
+        let template = matchedPath;
+        for (const [name, value] of Object.entries(params ?? {})) {
+            if (typeof value === 'string' && value.length > 0) {
+                template = template.replace(`/${value}`, `/:${name}`);
+            }
+        }
+        return template;
+    }
+
+    // Consume the portion of `path` matched by a mount layer, returning the prefix template
+    // (params reverse-substituted) and the remaining path for deeper layers.
+    private _peelMount(layer: Layer, path: string): { template: string, remainder: string } | undefined {
+        // Path-less mount (`app.use(router)`): contributes no prefix, path passes through.
+        if (layer.slash === true || layer.regexp?.fast_slash === true) {
+            return {template: '', remainder: path};
+        }
+        // Express 5: matchers return the matched concrete prefix and params.
+        if (layer.matchers) {
+            for (const matcher of layer.matchers) {
+                const result = matcher(path);
+                if (result) {
+                    const rest = path.slice(result.path.length);
+                    return {
+                        template: this._templatizeParams(result.path, result.params),
+                        remainder: rest.length > 0 ? rest : '/',
+                    };
+                }
+            }
+            return undefined;
+        }
+        // Express 4: the mount regexp matches the prefix; keys name the capture groups.
+        if (layer.regexp) {
+            const match = layer.regexp.exec(path);
+            if (!match) return undefined;
+            const matched = (match[0] ?? '').replace(/\/$/, '');
+            const params: Record<string, unknown> = {};
+            (layer.keys ?? []).forEach((key, index) => {
+                params[String(key.name)] = match[index + 1];
+            });
+            const rest = path.slice(matched.length);
+            return {
+                template: this._templatizeParams(matched, params),
+                remainder: rest.length > 0 ? rest : '/',
+            };
+        }
+        return undefined;
+    }
+
+    private _resolveChain(chain: RouteChain, fullPath: string): string | undefined {
+        let remainder = fullPath;
+        let prefix = '';
+        for (const mount of chain.mounts) {
+            const peeled = this._peelMount(mount, remainder);
+            if (!peeled) return undefined;
+            prefix += peeled.template;
+            remainder = peeled.remainder;
+        }
+        return this._buildMatcher(chain.leaf)(remainder) ? prefix + chain.leafPath : undefined;
     }
 
     setExpressApp(app: express.Application): void {
-        const routes: RouteMapping[] = [];
-
         // @types/express v4 types app.router as a deprecated string; cast to reach both v4/v5 shapes.
         // Read `_router` first: on Express 4 it holds the router stack, while `app.router`
         // is a getter that THROWS ("'app.router' is deprecated!"). On Express 5 `_router`
@@ -91,31 +181,9 @@ export class CoralogixTransactionSampler implements Sampler {
             return;
         }
 
-        expressRouter.stack.forEach((middleware: Handler | ILayer) => {
-            if (this._isMiddlewareILayer(middleware)) {
-                // routes registered directly on the app
-                if (middleware.route?.path)
-                    routes.push({
-                        path: middleware.route.path,
-                        matches: this._buildMatcher(middleware),
-                    });
-            } else if (this._isMiddlewareHandler(middleware)) {
-                // router middleware
-                const handle = middleware?.handle;
-                const stack = handle?.stack ?? handle?.__original?.stack;
-                stack && stack.forEach((handler) => {
-                    const route = handler.route;
-                    if (route) {
-                        routes.push({
-                            path: route.path,
-                            matches: this._buildMatcher(handler),
-                        });
-                    }
-                });
-            }
-        });
-
-        this.routes = [...this.routes, ...routes];
+        const chains: RouteChain[] = [];
+        this._collectChains(expressRouter.stack, [], chains);
+        this.routeChains = [...this.routeChains, ...chains];
     }
 
     shouldSample(context: Context, traceId: string, spanName: string, spanKind: SpanKind, attributes: Attributes, links: Link[]): SamplingResult {
