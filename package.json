@@ -1,6 +1,6 @@
 {
   "name": "@coralogix/opentelemetry",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
   "types": "dist/index.d.ts",
@@ -19,11 +19,15 @@
     "build": "tsup src/index.ts --format cjs,esm --clean --sourcemap --dts"
   },
   "dependencies": {
-    "@opentelemetry/api": "^1.7.0",
-    "@opentelemetry/sdk-trace-base": "^2.8.0",
     "@opentelemetry/semantic-conventions": "^1.25.1"
   },
+  "peerDependencies": {
+    "@opentelemetry/api": "^1.7.0",
+    "@opentelemetry/sdk-trace-base": "^2.8.0"
+  },
   "devDependencies": {
+    "@opentelemetry/api": "^1.7.0",
+    "@opentelemetry/sdk-trace-base": "^2.8.0",
     "@types/express": "^4.17.21",
     "@types/lodash": "^4.14.201",
     "@types/node": "^20.8.8",

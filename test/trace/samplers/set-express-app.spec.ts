@@ -29,6 +29,22 @@ function express4App() {
     return {_router: {stack: [routeLayer]}};
 }
 
+// Real Express 4 exposes `app.router` as a getter that throws
+// ("'app.router' is deprecated!"); only `app._router` is safe to read.
+function express4AppWithDeprecatedRouterGetter() {
+    const routeLayer = {
+        name: 'bound dispatch',
+        route: {path: '/users/:id'},
+        regexp: /^\/users\/(?:([^/]+?))\/?$/i,
+    };
+    return {
+        get router(): never {
+            throw new Error("'app.router' is deprecated!");
+        },
+        _router: {stack: [routeLayer]},
+    };
+}
+
 function express5App() {
     const routeLayer = {
         name: 'bound dispatch',
@@ -48,10 +64,26 @@ export default describe('CoralogixTransactionSampler#setExpressApp', () => {
         assert.strictEqual(resolveTransaction(sampler, httpTarget('/users/123')), 'GET /users/:id');
     });
 
+    it('does not throw on Express 4 where app.router is a deprecated throwing getter (regression)', () => {
+        const sampler = new CoralogixTransactionSampler();
+        const app = express4AppWithDeprecatedRouterGetter();
+
+        assert.doesNotThrow(() => sampler.setExpressApp(app as never));
+        assert.strictEqual(resolveTransaction(sampler, httpTarget('/users/123')), 'GET /users/:id');
+    });
+
     it('does not throw when Express 5 has no _router', () => {
         const sampler = new CoralogixTransactionSampler();
 
         assert.doesNotThrow(() => sampler.setExpressApp(express5App() as never));
+    });
+
+    it('does not throw and registers no routes when the app exposes no router stack', () => {
+        const sampler = new CoralogixTransactionSampler();
+
+        assert.doesNotThrow(() => sampler.setExpressApp({} as never));
+        // With no routes resolved, the transaction falls back to the bare span name.
+        assert.strictEqual(resolveTransaction(sampler, urlPath('/users/123')), 'GET');
     });
 
     it('resolves the route template on Express 5', () => {
