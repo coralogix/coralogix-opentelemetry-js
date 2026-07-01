@@ -78,6 +78,14 @@ export default describe('CoralogixTransactionSampler#setExpressApp', () => {
         assert.doesNotThrow(() => sampler.setExpressApp(express5App() as never));
     });
 
+    it('does not throw and registers no routes when the app exposes no router stack', () => {
+        const sampler = new CoralogixTransactionSampler();
+
+        assert.doesNotThrow(() => sampler.setExpressApp({} as never));
+        // With no routes resolved, the transaction falls back to the bare span name.
+        assert.strictEqual(resolveTransaction(sampler, urlPath('/users/123')), 'GET');
+    });
+
     it('resolves the route template on Express 5', () => {
         const sampler = new CoralogixTransactionSampler();
         sampler.setExpressApp(express5App() as never);
