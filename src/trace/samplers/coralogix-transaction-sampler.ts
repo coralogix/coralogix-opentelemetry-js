@@ -4,7 +4,13 @@ import * as opentelemetry from "@opentelemetry/api";
 import {CoralogixAttributes, CoralogixTraceState} from "../common";
 import type express from 'express';
 import {ILayer} from "express-serve-static-core";
-import {SEMATTRS_HTTP_TARGET} from "@opentelemetry/semantic-conventions";
+import {ATTR_URL_PATH} from "@opentelemetry/semantic-conventions";
+
+// `http.target` is the legacy (pre-stability) HTTP attribute. It was removed from the stable
+// semantic-conventions entry point in favour of `url.path`, but instrumentations that have not
+// opted into stable HTTP semconv (OTEL_SEMCONV_STABILITY_OPT_IN) still emit it. Read the stable
+// `url.path` first and fall back to the legacy attribute so route resolution works in every mode.
+const ATTR_HTTP_TARGET_LEGACY = "http.target";
 
 export interface RouteMapping {
     matches: (path: string) => boolean,
@@ -114,7 +120,7 @@ export class CoralogixTransactionSampler implements Sampler {
         try {
             const spanContext = opentelemetry.trace.getSpanContext(context);
 
-            const httpTarget = attributes?.[SEMATTRS_HTTP_TARGET]?.toString();
+            const httpTarget = (attributes?.[ATTR_URL_PATH] ?? attributes?.[ATTR_HTTP_TARGET_LEGACY])?.toString();
             const path = this._getPathFromRoutes(httpTarget ?? '');
 
             const transactionName = path ? this._buildTransactionNameFromExpressPath(path, spanName) : spanName;
