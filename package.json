@@ -1,6 +1,8 @@
 {
   "name": "@coralogix/opentelemetry",
   "version": "0.4.0",
+  "license": "Apache-2.0",
+  "description": "Coralogix extensions for the OpenTelemetry Node SDK, including a transaction sampler for Coralogix APM.",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
   "types": "dist/index.d.ts",
