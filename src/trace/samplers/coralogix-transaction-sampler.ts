@@ -54,6 +54,13 @@ interface RouteChain {
 export class CoralogixTransactionSampler implements Sampler {
     private readonly baseSampler: Sampler;
     private routeChains: RouteChain[] = [];
+    // Express 4: per-layer cache of the mount regexp recompiled with the `d` (hasIndices) flag,
+    // used to locate capture groups by position rather than by value.
+    private readonly indexedRegexpCache = new WeakMap<Layer, RegExp>();
+    // Express 5: per-layer cache mapping each prefix segment index to the param name it carries
+    // (absent = static segment). Keyed alongside the segment count so a differently-shaped match
+    // (e.g. a wildcard mount) recomputes instead of reusing a stale plan.
+    private readonly express5PlanCache = new WeakMap<Layer, { segmentCount: number, plan: Map<number, string> }>();
 
     constructor(baseSampler?: Sampler) {
         if (baseSampler) {
@@ -106,16 +113,77 @@ export class CoralogixTransactionSampler implements Sampler {
         }
     }
 
-    // Rebuild a route template segment by substituting concrete param values back to `:name`,
-    // e.g. matched `/v/2` with params {ver: '2'} becomes `/v/:ver`.
-    private _templatizeParams(matchedPath: string, params?: Record<string, unknown>): string {
-        let template = matchedPath;
-        for (const [name, value] of Object.entries(params ?? {})) {
-            if (typeof value === 'string' && value.length > 0) {
-                template = template.replace(`/${value}`, `/:${name}`);
+    // Reverse-substitute an Express 4 mount prefix to its template using capture-group positions.
+    // The compiled mount regexp is anchored at `^`, so capture-group offsets map directly onto the
+    // matched prefix. Positional substitution (rather than `String.replace` by value) is required
+    // because a param value can equal an earlier static segment (e.g. `/v/:ver` matching `/v/v`).
+    private _templatizeExpress4(layer: Layer, path: string, rawMatched: string): string {
+        const keys = layer.keys ?? [];
+        if (keys.length === 0 || !layer.regexp) return rawMatched.replace(/\/$/, '');
+
+        let indexedRegexp = this.indexedRegexpCache.get(layer);
+        if (!indexedRegexp) {
+            const {source, flags} = layer.regexp;
+            indexedRegexp = new RegExp(source, flags.includes('d') ? flags : `${flags}d`);
+            this.indexedRegexpCache.set(layer, indexedRegexp);
+        }
+
+        const match = indexedRegexp.exec(path) as (RegExpExecArray & { indices?: Array<[number, number] | undefined> }) | null;
+        const indices = match?.indices;
+        if (!indices) return rawMatched.replace(/\/$/, '');
+
+        // Substitute from right to left so earlier offsets stay valid as the string is spliced.
+        const spans = keys
+            .map((key, index) => ({span: indices[index + 1], name: String(key.name)}))
+            .filter((entry): entry is { span: [number, number], name: string } => entry.span !== undefined)
+            .sort((a, b) => b.span[0] - a.span[0]);
+
+        let template = rawMatched;
+        for (const {span, name} of spans) {
+            template = `${template.slice(0, span[0])}:${name}${template.slice(span[1])}`;
+        }
+        return template.replace(/\/$/, '');
+    }
+
+    // Reverse-substitute an Express 5 mount prefix to its template. Express 5 layers expose only a
+    // matcher function (no regexp/keys), so param positions are discovered by probing: replacing one
+    // prefix segment at a time with a sentinel and checking which param the matcher reports it as.
+    // The resulting segment->param plan is cached per layer since the mount template is invariant.
+    private _templatizeExpress5(layer: Layer, matcher: (path: string) => PathMatch | false, fullPath: string, result: PathMatch): string {
+        const {path: matchedPath, params} = result;
+        if (!params || Object.keys(params).length === 0) return matchedPath;
+
+        const segments = matchedPath.split('/');
+        let cached = this.express5PlanCache.get(layer);
+        if (!cached || cached.segmentCount !== segments.length) {
+            cached = {segmentCount: segments.length, plan: this._computeExpress5Plan(matcher, fullPath, matchedPath)};
+            this.express5PlanCache.set(layer, cached);
+        }
+
+        return segments
+            .map((segment, index) => {
+                const name = cached!.plan.get(index);
+                return name !== undefined ? `:${name}` : segment;
+            })
+            .join('/');
+    }
+
+    private _computeExpress5Plan(matcher: (path: string) => PathMatch | false, fullPath: string, matchedPath: string): Map<number, string> {
+        const remainder = fullPath.slice(matchedPath.length);
+        const segments = matchedPath.split('/');
+        const plan = new Map<number, string>();
+        for (let index = 0; index < segments.length; index++) {
+            if (segments[index] === '') continue;
+            const sentinel = `cgxprobe${index}`;
+            const probeSegments = segments.slice();
+            probeSegments[index] = sentinel;
+            const probe = matcher(probeSegments.join('/') + remainder);
+            if (probe && probe.params) {
+                const hit = Object.entries(probe.params).find(([, value]) => value === sentinel);
+                if (hit) plan.set(index, hit[0]);
             }
         }
-        return template;
+        return plan;
     }
 
     // Consume the portion of `path` matched by a mount layer, returning the prefix template
@@ -132,7 +200,7 @@ export class CoralogixTransactionSampler implements Sampler {
                 if (result) {
                     const rest = path.slice(result.path.length);
                     return {
-                        template: this._templatizeParams(result.path, result.params),
+                        template: this._templatizeExpress5(layer, matcher, path, result),
                         remainder: rest.length > 0 ? rest : '/',
                     };
                 }
@@ -143,14 +211,11 @@ export class CoralogixTransactionSampler implements Sampler {
         if (layer.regexp) {
             const match = layer.regexp.exec(path);
             if (!match) return undefined;
-            const matched = (match[0] ?? '').replace(/\/$/, '');
-            const params: Record<string, unknown> = {};
-            (layer.keys ?? []).forEach((key, index) => {
-                params[String(key.name)] = match[index + 1];
-            });
-            const rest = path.slice(matched.length);
+            const rawMatched = match[0] ?? '';
+            const consumedLength = rawMatched.replace(/\/$/, '').length;
+            const rest = path.slice(consumedLength);
             return {
-                template: this._templatizeParams(matched, params),
+                template: this._templatizeExpress4(layer, path, rawMatched),
                 remainder: rest.length > 0 ? rest : '/',
             };
         }

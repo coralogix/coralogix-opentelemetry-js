@@ -81,6 +81,33 @@ export default describe('CoralogixTransactionSampler#setExpressApp (integration)
 
                 assert.strictEqual(resolveTransaction(sampler, '/v/2/things/abc'), 'GET /v/:ver/things/:t');
             });
+
+            it('templatizes a mount-prefix param whose value equals an earlier static segment', () => {
+                const app = factory();
+                const verRouter = factory.Router();
+                verRouter.get('/things/:id', noop);
+                app.use('/v/:ver', verRouter);
+
+                const sampler = new CoralogixTransactionSampler();
+                sampler.setExpressApp(app);
+
+                // The concrete value `v` equals the static `/v` segment; reconstruction must be
+                // positional so the template is not corrupted into `/:ver/v/...`.
+                assert.strictEqual(resolveTransaction(sampler, '/v/v/things/1'), 'GET /v/:ver/things/:id');
+            });
+
+            it('templatizes multiple mount-prefix params, including value/static collisions', () => {
+                const app = factory();
+                const inner = factory.Router();
+                inner.get('/items/:iid', noop);
+                app.use('/g/:group/g/:sub', inner);
+
+                const sampler = new CoralogixTransactionSampler();
+                sampler.setExpressApp(app);
+
+                // Params `g`/`x` collide with the static `/g` segments in the prefix.
+                assert.strictEqual(resolveTransaction(sampler, '/g/g/g/x/items/7'), 'GET /g/:group/g/:sub/items/:iid');
+            });
         });
     }
 });

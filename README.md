@@ -120,12 +120,7 @@ a request to `/api/deep/orders/9` resolves to the transaction `GET /api/deep/ord
 
 Both **Express 4** and **Express 5** are supported.
 
-One caveat applies to a parameter used in a *mount prefix* (`app.use("/v/:ver", router)`):
-
-- On **Express 5**, it templatizes correctly — `/v/2/things/abc` → `GET /v/:ver/things/:t`.
-- On **Express 4**, the concrete value is kept — `/v/2/things/abc` → `GET /v/2/things/:t`.
-
-Parameters in ordinary (non-prefix) route paths templatize correctly on both versions.
+Parameters are templatized correctly on both versions, including a parameter used in a *mount prefix* (`app.use("/v/:ver", router)`): a request to `/v/2/things/abc` resolves to `GET /v/:ver/things/:t`.
 
 ## Changelog
 
