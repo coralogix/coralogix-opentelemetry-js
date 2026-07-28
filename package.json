@@ -28,7 +28,12 @@
     "@opentelemetry/sdk-trace-base": "^2.8.0"
   },
   "devDependencies": {
+    "@grpc/grpc-js": "^1.14.4",
     "@opentelemetry/api": "^1.7.0",
+    "@opentelemetry/core": "^2.8.0",
+    "@opentelemetry/exporter-metrics-otlp-grpc": "^0.208.0",
+    "@opentelemetry/exporter-trace-otlp-grpc": "^0.208.0",
+    "@opentelemetry/sdk-metrics": "^2.10.0",
     "@opentelemetry/sdk-trace-base": "^2.8.0",
     "@types/express": "^4.17.21",
     "@types/lodash": "^4.14.201",

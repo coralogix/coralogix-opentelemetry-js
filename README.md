@@ -3,7 +3,7 @@
 [![npm version](https://img.shields.io/npm/v/@coralogix/opentelemetry.svg)](https://www.npmjs.com/package/@coralogix/opentelemetry)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
 
-Coralogix extensions for the [OpenTelemetry Node SDK](https://github.com/open-telemetry/opentelemetry-js). This package adds Coralogix-specific behavior on top of a standard OpenTelemetry tracing setup — most notably a sampler that defines and propagates Coralogix [transactions](https://coralogix.com/docs/user-guides/apm/features/transactions/) for APM.
+Coralogix extensions for the [OpenTelemetry Node SDK](https://github.com/open-telemetry/opentelemetry-js). This package adds Coralogix-specific behavior on top of a standard OpenTelemetry tracing setup — transaction tagging via a sampler and/or a `SpanProcessor`, including exclusive self-time on the processor path.
 
 ```bash
 npm install --save @coralogix/opentelemetry
@@ -65,6 +65,26 @@ When a span starts a transaction, the sampler adds the following attributes:
 | `cgx.transaction` | The transaction name (e.g. `GET /users/:id`). |
 | `cgx.transaction.distributed` | The distributed transaction name propagated across services. |
 | `cgx.transaction.root` | Whether this span is the root of the transaction. |
+
+## TransactionSpanProcessor
+
+`TransactionSpanProcessor` wraps a `SpanExporter` to tag Coralogix transactions, stamp exclusive self-time (`cgx.transaction.self_time`, seconds) on completed local traces, and record the matching histogram (unit `s`). It works with any sampler.
+
+By default: keep at most **256** slowest spans per local trace (`maxNodes`), and export only the **slowest** completed local trace every **60s** (`maxRegularTraces: 1`). Self-time metrics are still recorded for every completed local trace. Set `maxRegularTraces: 0` to export every completed (trimmed) trace immediately.
+
+```js
+import { BasicTracerProvider, ConsoleSpanExporter } from "@opentelemetry/sdk-trace-base";
+import { TransactionSpanProcessor } from "@coralogix/opentelemetry";
+
+const tracerProvider = new BasicTracerProvider({
+    spanProcessors: [
+        new TransactionSpanProcessor(new ConsoleSpanExporter(), {
+            // Optional MeterProvider for the self-time histogram; defaults to the global one.
+            // maxRegularTraces: 0, // export all completed traces (tests / debugging)
+        }),
+    ],
+});
+```
 
 ## Transactions with Express
 
