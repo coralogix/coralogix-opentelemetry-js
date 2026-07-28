@@ -3,10 +3,17 @@ import assert from "node:assert";
 import {setTimeout as sleep} from "node:timers/promises";
 import * as opentelemetry from "@opentelemetry/api";
 import {Context, ROOT_CONTEXT, SpanKind} from "@opentelemetry/api";
-import {BasicTracerProvider, InMemorySpanExporter} from "@opentelemetry/sdk-trace-base";
+import {
+    BasicTracerProvider,
+    InMemorySpanExporter,
+    ReadableSpan,
+    SpanExporter,
+} from "@opentelemetry/sdk-trace-base";
+import {ExportResultCode} from "@opentelemetry/core";
 import {MeterProvider, MetricReader} from "@opentelemetry/sdk-metrics";
-import {CoralogixAttributes} from "../../../src/trace/common";
+import {CoralogixAttributes, CoralogixTraceState} from "../../../src/trace/common";
 import {TransactionSpanProcessor} from "../../../src/trace/processors";
+import {createTraceState} from "@opentelemetry/api";
 
 // Minimal MetricReader that just exposes `collect()` synchronously for assertions, without any
 // push/pull export loop of its own.
@@ -17,6 +24,29 @@ class TestMetricReader extends MetricReader {
 
     protected async onShutdown(): Promise<void> {
         return Promise.resolve();
+    }
+}
+
+/** Keeps spans across exporter.shutdown() (InMemorySpanExporter clears). */
+class StickySpanExporter implements SpanExporter {
+    private spans: ReadableSpan[] = [];
+    private shut = false;
+
+    export(spans: ReadableSpan[], resultCallback: (result: {code: ExportResultCode}) => void): void {
+        if (this.shut) {
+            resultCallback({code: ExportResultCode.FAILED});
+            return;
+        }
+        this.spans.push(...spans);
+        resultCallback({code: ExportResultCode.SUCCESS});
+    }
+
+    async shutdown(): Promise<void> {
+        this.shut = true;
+    }
+
+    getFinishedSpans(): ReadableSpan[] {
+        return this.spans.slice();
     }
 }
 
@@ -119,6 +149,7 @@ export default describe('TransactionSpanProcessor', () => {
             'ForceFlush must not finalize incomplete local traces');
 
         root.end();
+        await provider.forceFlush();
         assert.strictEqual(exporter.getFinishedSpans().length, 2,
             'both spans must be exported once the whole local trace has ended');
 
@@ -301,6 +332,201 @@ export default describe('TransactionSpanProcessor', () => {
             metricNames.includes(CoralogixAttributes.SELF_TIME),
             'metrics are recorded even for traces that lose the harvest',
         );
+
+        await provider.shutdown();
+        await meterProvider.shutdown();
+    });
+
+    it('preserves a pre-set cgx.transaction name (e.g. sampler Express template)', async () => {
+        const {provider, tracer, exporter, meterProvider} = buildProvider();
+
+        const root = tracer.startSpan('GET /users/123', {
+            kind: SpanKind.SERVER,
+            attributes: {[CoralogixAttributes.TRANSACTION_IDENTIFIER]: 'GET /users/:id'},
+        });
+        root.end();
+
+        await provider.forceFlush();
+        const spans = exporter.getFinishedSpans();
+        assert.strictEqual(spans.length, 1);
+        assert.strictEqual(
+            spans[0]!.attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER],
+            'GET /users/:id',
+        );
+        assert.strictEqual(spans[0]!.attributes[CoralogixAttributes.TRANSACTION_ROOT], true);
+
+        await provider.shutdown();
+        await meterProvider.shutdown();
+    });
+
+    it('shutdown drops incomplete local traces instead of partially finalizing them', async () => {
+        const exporter = new StickySpanExporter();
+        const reader = new TestMetricReader();
+        const meterProvider = new MeterProvider({readers: [reader]});
+        const processor = new TransactionSpanProcessor(exporter, {
+            meterProvider,
+            maxRegularTraces: 0,
+            shutdownIdleWaitMillis: 20,
+        });
+        const provider = new BasicTracerProvider({spanProcessors: [processor]});
+        const tracer = provider.getTracer('test');
+
+        const root = tracer.startSpan('parent', {kind: SpanKind.SERVER, startTime: [0, 0]});
+        const rootCtx = opentelemetry.trace.setSpan(ROOT_CONTEXT, root);
+        const child = tracer.startSpan('child', {startTime: [0, 10]}, rootCtx);
+        child.end([0, 30]);
+
+        await provider.shutdown();
+        assert.strictEqual(
+            exporter.getFinishedSpans().length,
+            0,
+            'incomplete local trace must not be partially finalized on shutdown timeout',
+        );
+
+        root.end([0, 50]);
+        assert.strictEqual(
+            exporter.getFinishedSpans().length,
+            0,
+            'late end after exporter shutdown must not export',
+        );
+
+        await meterProvider.shutdown();
+    });
+
+    it('tracks post-shutdown children of in-flight traces so parents are not finalized early', async () => {
+        const exporter = new StickySpanExporter();
+        const reader = new TestMetricReader();
+        const meterProvider = new MeterProvider({readers: [reader]});
+        const processor = new TransactionSpanProcessor(exporter, {
+            meterProvider,
+            maxRegularTraces: 0,
+            shutdownIdleWaitMillis: 500,
+        });
+        const provider = new BasicTracerProvider({spanProcessors: [processor]});
+        const tracer = provider.getTracer('test');
+
+        const root = tracer.startSpan('parent', {kind: SpanKind.SERVER, startTime: [0, 0]});
+        const rootCtx = opentelemetry.trace.setSpan(ROOT_CONTEXT, root);
+
+        const shutdownPromise = provider.shutdown();
+        await sleep(10);
+
+        const child = tracer.startSpan('late-child', {startTime: [0, 20]}, rootCtx);
+        root.end([0, 40]);
+        await sleep(20);
+        assert.strictEqual(
+            exporter.getFinishedSpans().length,
+            0,
+            'parent must not export while post-stop child is still live',
+        );
+
+        child.end([0, 80]);
+        await shutdownPromise;
+
+        const spans = exporter.getFinishedSpans();
+        assert.strictEqual(spans.length, 2);
+        assert.ok(spans.some((s) => s.name === 'parent'));
+        assert.ok(spans.some((s) => s.name === 'late-child'));
+
+        await meterProvider.shutdown();
+    });
+
+    it('inherits cgx.transaction from parent TraceState when parent span has no attributes', async () => {
+        const {provider, tracer, exporter, meterProvider} = buildProvider();
+
+        const parentTraceState = createTraceState().set(
+            CoralogixTraceState.TRANSACTION_IDENTIFIER,
+            'from-tracestate',
+        );
+        const parentCtx = opentelemetry.trace.setSpanContext(ROOT_CONTEXT, {
+            traceId: '00000000000000000000000000000001',
+            spanId: '0000000000000001',
+            traceFlags: 1,
+            isRemote: false,
+            traceState: parentTraceState,
+        });
+
+        const child = tracer.startSpan('internal-child', {kind: SpanKind.INTERNAL}, parentCtx);
+        child.end();
+
+        await provider.forceFlush();
+        const spans = exporter.getFinishedSpans();
+        assert.strictEqual(spans.length, 1);
+        assert.strictEqual(
+            spans[0]!.attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER],
+            'from-tracestate',
+        );
+        assert.ok(
+            !(CoralogixAttributes.TRANSACTION_ROOT in spans[0]!.attributes),
+            'INTERNAL child under local parent must not become a new transaction root',
+        );
+
+        await provider.shutdown();
+        await meterProvider.shutdown();
+    });
+
+    it('exports immediately when harvestPeriodMillis is 0 (no silent heap drop)', async () => {
+        const exporter = new InMemorySpanExporter();
+        const reader = new TestMetricReader();
+        const meterProvider = new MeterProvider({readers: [reader]});
+        const processor = new TransactionSpanProcessor(exporter, {
+            meterProvider,
+            maxRegularTraces: 1,
+            harvestPeriodMillis: 0,
+        });
+        const provider = new BasicTracerProvider({spanProcessors: [processor]});
+        const tracer = provider.getTracer('test');
+
+        const root = tracer.startSpan('solo', {kind: SpanKind.SERVER});
+        root.end();
+
+        await provider.forceFlush();
+        assert.strictEqual(
+            exporter.getFinishedSpans().length,
+            1,
+            'period 0 must export without waiting for harvest timer',
+        );
+
+        await provider.shutdown();
+        await meterProvider.shutdown();
+    });
+
+    it('holdback keeps fire-and-forget children on the same local trace', async () => {
+        const exporter = new StickySpanExporter();
+        const reader = new TestMetricReader();
+        const meterProvider = new MeterProvider({readers: [reader]});
+        const processor = new TransactionSpanProcessor(exporter, {
+            meterProvider,
+            maxRegularTraces: 0,
+            completionHoldbackMillis: 50,
+        });
+        const provider = new BasicTracerProvider({spanProcessors: [processor]});
+        const tracer = provider.getTracer('test');
+
+        const root = tracer.startSpan('parent', {kind: SpanKind.SERVER, startTime: [0, 0]});
+        const rootCtx = opentelemetry.trace.setSpan(ROOT_CONTEXT, root);
+        root.end([0, 40]);
+
+        // Child starts after parent ended (same traceId via parent context).
+        await sleep(5);
+        assert.strictEqual(
+            exporter.getFinishedSpans().length,
+            0,
+            'must not finalize immediately while holdback is open',
+        );
+
+        const child = tracer.startSpan('async-child', {startTime: [0, 50]}, rootCtx);
+        child.end([0, 80]);
+
+        await provider.forceFlush();
+        const spans = exporter.getFinishedSpans();
+        assert.strictEqual(spans.length, 2, 'parent and late child must export together');
+        assert.ok(spans.some((s) => s.name === 'parent'));
+        assert.ok(spans.some((s) => s.name === 'async-child'));
+        const parentSpan = spans.find((s) => s.name === 'parent')!;
+        // parent [0,40], child [50,80] does not overlap parent → self-time = full 40ns... 
+        // wait times are [sec, ns] - [0,40] means 40 nanoseconds
+        assert.ok(CoralogixAttributes.SELF_TIME in parentSpan.attributes);
 
         await provider.shutdown();
         await meterProvider.shutdown();

@@ -1,8 +1,8 @@
 /**
  * Longest-duration node trim for transaction traces.
- * Keep at most `maxNodes` spans, preferring longer durations. The transaction
- * root is always retained. Dropped parents are re-linked to the nearest kept
- * ancestor.
+ * Keep at most `maxNodes` spans, preferring longer durations. Every
+ * transaction root is always retained. Dropped parents are re-linked to the
+ * nearest kept ancestor.
  */
 
 import {isSpanContextValid, SpanContext} from "@opentelemetry/api";
@@ -22,25 +22,33 @@ export function spanDurationNs(span: ReadableSpan): bigint {
 export function selectSlowestSpans(
     spans: ReadableSpan[],
     maxNodes: number = DEFAULT_MAX_TXN_TRACE_NODES,
-    rootSpanId?: string,
+    rootSpanIds?: string | readonly string[],
 ): ReadableSpan[] {
     if (maxNodes <= 0 || spans.length <= maxNodes) {
         return spans.slice();
     }
 
-    let root: ReadableSpan | undefined;
+    const protect = new Set(
+        typeof rootSpanIds === "string"
+            ? [rootSpanIds]
+            : rootSpanIds ?? [],
+    );
+
+    const roots: ReadableSpan[] = [];
     const others: ReadableSpan[] = [];
     for (const span of spans) {
-        if (rootSpanId !== undefined && span.spanContext().spanId === rootSpanId) {
-            root = span;
+        if (protect.has(span.spanContext().spanId)) {
+            roots.push(span);
         } else {
             others.push(span);
         }
     }
 
-    const slots = root === undefined ? maxNodes : maxNodes - 1;
-    if (slots <= 0) {
-        return root !== undefined ? [root] : [];
+    const slots = Math.max(0, maxNodes - roots.length);
+    if (slots === 0) {
+        const keptIds = new Set(roots.map((span) => span.spanContext().spanId));
+        const ordered = spans.filter((span) => keptIds.has(span.spanContext().spanId));
+        return reparentToKeptAncestors(ordered, spans);
     }
 
     type HeapItem = {duration: bigint; index: number; span: ReadableSpan};
@@ -109,9 +117,7 @@ export function selectSlowestSpans(
     }
 
     const kept = heap.map((item) => item.span);
-    if (root !== undefined) {
-        kept.push(root);
-    }
+    kept.push(...roots);
 
     const keptIds = new Set(kept.map((span) => span.spanContext().spanId));
     const ordered = spans.filter((span) => keptIds.has(span.spanContext().spanId));

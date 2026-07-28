@@ -105,9 +105,10 @@ export class RegularTraceHeap {
     }
 }
 
-/** Duration of the transaction root, else max span duration in the batch. */
+/** Duration of the longest transaction root, else max span duration in the batch. */
 export function rootDurationNs(spans: ReadableSpan[]): bigint {
-    let root: ReadableSpan | undefined;
+    let maxRootDuration = ZERO;
+    let foundRoot = false;
     let maxDuration = ZERO;
     for (const span of spans) {
         const duration = spanDurationNs(span);
@@ -115,11 +116,14 @@ export function rootDurationNs(spans: ReadableSpan[]): bigint {
             maxDuration = duration;
         }
         if (span.attributes[CoralogixAttributes.TRANSACTION_ROOT] === true) {
-            root = span;
+            foundRoot = true;
+            if (duration > maxRootDuration) {
+                maxRootDuration = duration;
+            }
         }
     }
-    if (root !== undefined) {
-        return spanDurationNs(root);
+    if (foundRoot) {
+        return maxRootDuration;
     }
     return maxDuration;
 }

@@ -85,4 +85,12 @@ export default describe("RegularTraceHeap", () => {
         ];
         assert.strictEqual(rootDurationNs(spans), BigInt(100));
     });
+
+    it("rootDurationNs uses max among multiple roots", () => {
+        const spans = [
+            makeSpan("long", "1", 0, 200, true),
+            makeSpan("short", "2", 0, 50, true),
+        ];
+        assert.strictEqual(rootDurationNs(spans), BigInt(200));
+    });
 });

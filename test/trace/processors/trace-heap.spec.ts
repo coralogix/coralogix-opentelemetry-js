@@ -95,4 +95,17 @@ export default describe("selectSlowestSpans", () => {
         const db = kept.find((s) => s.name === "db")!;
         assert.strictEqual(db.parentSpanContext?.spanId, ROOT);
     });
+
+    it("protects every transaction root when maxNodes is tight", () => {
+        const rootA = "0000000000000001";
+        const rootB = "0000000000000002";
+        const slow = "0000000000000003";
+        const spans = [
+            makeSpan({name: "root-a", spanId: rootA, startNs: 0, endNs: 1, root: true}),
+            makeSpan({name: "root-b", spanId: rootB, startNs: 0, endNs: 1, parentSpanId: rootA, root: true}),
+            makeSpan({name: "slow", spanId: slow, startNs: 0, endNs: 100, parentSpanId: rootA}),
+        ];
+        const kept = selectSlowestSpans(spans, 2, [rootA, rootB]);
+        assert.deepStrictEqual(new Set(kept.map((s) => s.name)), new Set(["root-a", "root-b"]));
+    });
 });
