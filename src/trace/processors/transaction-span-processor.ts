@@ -49,14 +49,8 @@ export interface TransactionSpanProcessorOptions {
     shutdownIdleWaitMillis?: number;
 }
 
-/** Default holdback after the last live span ends before finalizing a local trace. */
 export const DEFAULT_COMPLETION_HOLDBACK_MILLIS = 100;
 
-/**
- * Tags Coralogix transactions on start, stamps exclusive self-time on end,
- * records the {@link CoralogixAttributes.SELF_TIME} histogram, trims to the
- * slowest nodes, and harvests the slowest completed local trace(s) per window.
- */
 export class TransactionSpanProcessor implements SpanProcessor {
     private readonly exporter: SpanExporter;
     private readonly buffers = new Map<string, ReadableSpan[]>();
@@ -74,8 +68,12 @@ export class TransactionSpanProcessor implements SpanProcessor {
     private harvestTimer: ReturnType<typeof setInterval> | undefined;
     /** traceId -> holdback timer after last live span ended */
     private readonly pendingCompletions = new Map<string, ReturnType<typeof setTimeout>>();
+    /** parentSpanId -> ended direct-child intervals kept for outer self-time after nested txn export */
+    private readonly childIntervals = new Map<string, Array<{startNs: bigint; endNs: bigint}>>();
     /** In-flight exporter.export promises; forceFlush/shutdown wait for these. */
     private readonly pendingExports = new Set<Promise<void>>();
+    /** Serializes exporter.export so at most one call is in flight. */
+    private exportChain: Promise<void> = Promise.resolve();
     private stopped = false;
     private exporterShutdown = false;
     private shutdownPromise: Promise<void> | undefined;
@@ -99,7 +97,6 @@ export class TransactionSpanProcessor implements SpanProcessor {
                     diag.warn("TransactionSpanProcessor: harvest flush failed", error);
                 });
             }, this.harvestPeriodMillis);
-            // Do not keep the process alive solely for harvest.
             if (typeof this.harvestTimer.unref === "function") {
                 this.harvestTimer.unref();
             }
@@ -124,13 +121,8 @@ export class TransactionSpanProcessor implements SpanProcessor {
         const {traceId, spanId} = span.spanContext();
         const parentId = trace.getSpanContext(parentContext)?.spanId;
 
-        // A new span on this traceId cancels an in-flight completion holdback
-        // (fire-and-forget child starting after the parent ended).
         this.cancelPendingCompletion(traceId);
 
-        // After shutdown begins, do not open new local traces — but still
-        // register children of already-tracked traces so onEnd cannot finalize
-        // a parent while a post-shutdown child is still running.
         if (this.stopped) {
             const live = this.liveParents.get(traceId);
             const hasBuffer = this.buffers.has(traceId);
@@ -158,6 +150,16 @@ export class TransactionSpanProcessor implements SpanProcessor {
             return;
         }
 
+        const parentId = span.parentSpanContext?.spanId;
+        if (parentId) {
+            const intervals = this.childIntervals.get(parentId) ?? [];
+            intervals.push({
+                startNs: hrTimeToBigIntNanos(span.startTime),
+                endNs: hrTimeToBigIntNanos(span.endTime),
+            });
+            this.childIntervals.set(parentId, intervals);
+        }
+
         const buffer = this.buffers.get(traceId) ?? [];
         buffer.push(span);
         this.buffers.set(traceId, buffer);
@@ -166,21 +168,37 @@ export class TransactionSpanProcessor implements SpanProcessor {
             live.delete(spanId);
             if (live.size === 0) {
                 this.liveParents.delete(traceId);
-                this.scheduleCompletion(traceId);
             }
-        } else if (!this.liveParents.has(traceId)) {
+        }
+
+        const stillLive = this.liveParents.get(traceId);
+        if (stillLive && stillLive.size > 0) {
+            const batches = this.extractCompletedLocalTransactions(traceId);
+            for (const batch of batches) {
+                this.acceptCompleted(batch);
+            }
+            return;
+        }
+
+        if (this.buffers.get(traceId)?.length) {
+            this.scheduleCompletion(traceId);
+        } else if (!this.liveParents.has(traceId) && !live) {
             // No live tracking (missed onStart); finalize via holdback/immediate.
             this.scheduleCompletion(traceId);
         }
     }
 
     async forceFlush(): Promise<void> {
+        if (this.exporterShutdown) {
+            return;
+        }
         this.flushPendingCompletions();
         await this.flushHarvest();
         await this.awaitPendingExports();
-        if (this.exporter.forceFlush) {
-            await this.exporter.forceFlush();
+        if (this.exporterShutdown || !this.exporter.forceFlush) {
+            return;
         }
+        await this.runOnExportChain(async () => this.exporter.forceFlush!());
     }
 
     async shutdown(): Promise<void> {
@@ -199,31 +217,34 @@ export class TransactionSpanProcessor implements SpanProcessor {
         }
         await this.waitForIdle(this.shutdownIdleWaitMillis);
 
-        // Finalize traces whose last live span already ended (holdback pending).
         this.flushPendingCompletions();
 
-        const pending = Array.from(this.buffers.entries());
-        this.buffers.clear();
-        const liveSnapshot = new Map(this.liveParents);
-        this.liveParents.clear();
-
-        for (const [traceId, spans] of pending) {
-            const live = liveSnapshot.get(traceId);
-            // Finalize only when every tracked span in the local trace ended.
+        for (const traceId of [...this.buffers.keys()]) {
+            const live = this.liveParents.get(traceId);
             if (live && live.size > 0) {
+                const dropped = this.buffers.get(traceId) ?? [];
+                this.buffers.delete(traceId);
+                this.liveParents.delete(traceId);
+                for (const span of dropped) {
+                    this.childIntervals.delete(span.spanContext().spanId);
+                }
                 this.clearTransactionsForTrace(traceId);
                 continue;
             }
-            if (spans.length > 0) {
-                this.acceptCompleted(spans);
+            const batches = this.extractCompletedLocalTransactions(traceId, true);
+            for (const batch of batches) {
+                this.acceptCompleted(batch);
             }
             this.clearTransactionsForTrace(traceId);
         }
+        this.buffers.clear();
+        this.liveParents.clear();
         await this.flushHarvest();
         await this.awaitPendingExports();
         this.exporterShutdown = true;
         this.transactionsBySpan.clear();
-        await this.exporter.shutdown();
+        this.childIntervals.clear();
+        await this.runOnExportChain(async () => this.exporter.shutdown());
     }
 
     private cancelPendingCompletion(traceId: string): void {
@@ -234,47 +255,167 @@ export class TransactionSpanProcessor implements SpanProcessor {
         }
     }
 
-    /**
-     * After the last live span ends, wait briefly so a same-traceId child that
-     * starts afterward (fire-and-forget) can still join this local trace.
-     */
     private scheduleCompletion(traceId: string): void {
         this.cancelPendingCompletion(traceId);
+        if (this.exporterShutdown) {
+            return;
+        }
         if (this.completionHoldbackMillis <= 0) {
             this.finalizeTraceIfIdle(traceId);
             return;
         }
         const timer = setTimeout(() => {
+            if (this.exporterShutdown) {
+                return;
+            }
+            if (this.pendingCompletions.get(traceId) !== timer) {
+                return;
+            }
             this.pendingCompletions.delete(traceId);
             this.finalizeTraceIfIdle(traceId);
         }, this.completionHoldbackMillis);
-        if (typeof timer.unref === "function") {
-            timer.unref();
-        }
         this.pendingCompletions.set(traceId, timer);
     }
 
     private flushPendingCompletions(): void {
-        const traceIds = [...this.pendingCompletions.keys()];
-        for (const traceId of traceIds) {
+        for (const traceId of [...this.pendingCompletions.keys()]) {
             this.cancelPendingCompletion(traceId);
+        }
+        for (const traceId of [...this.buffers.keys()]) {
+            const live = this.liveParents.get(traceId);
+            if (live && live.size > 0) {
+                continue;
+            }
             this.finalizeTraceIfIdle(traceId);
         }
     }
 
     private finalizeTraceIfIdle(traceId: string): void {
+        if (this.exporterShutdown) {
+            return;
+        }
         const live = this.liveParents.get(traceId);
         if (live && live.size > 0) {
             return;
         }
-        const buffer = this.buffers.get(traceId);
-        if (!buffer || buffer.length === 0) {
-            return;
+        const batches = this.extractCompletedLocalTransactions(traceId, true);
+        for (const batch of batches) {
+            this.acceptCompleted(batch);
         }
-        this.buffers.delete(traceId);
         this.liveParents.delete(traceId);
         this.clearTransactionsForTrace(traceId);
-        this.acceptCompleted(buffer);
+    }
+
+    private extractCompletedLocalTransactions(
+        traceId: string,
+        flushLeftoverWhenIdle = false,
+    ): ReadableSpan[][] {
+        const buffer = this.buffers.get(traceId);
+        if (!buffer || buffer.length === 0) {
+            return [];
+        }
+
+        const live = this.liveParents.get(traceId) ?? new Map<string, string | undefined>();
+        const parentOf = new Map<string, string>();
+        for (const span of buffer) {
+            const parentId = span.parentSpanContext?.spanId;
+            if (parentId) {
+                parentOf.set(span.spanContext().spanId, parentId);
+            }
+        }
+        for (const [spanId, parentId] of live) {
+            if (parentId) {
+                parentOf.set(spanId, parentId);
+            }
+        }
+
+        const underRoot = (spanId: string, rootId: string): boolean => {
+            const seen = new Set<string>();
+            let cur: string | undefined = spanId;
+            while (cur && !seen.has(cur)) {
+                if (cur === rootId) {
+                    return true;
+                }
+                seen.add(cur);
+                cur = parentOf.get(cur);
+            }
+            return false;
+        };
+
+        const hasLiveInSubtree = (rootId: string): boolean => {
+            if (live.has(rootId)) {
+                return true;
+            }
+            for (const liveId of live.keys()) {
+                if (underRoot(liveId, rootId)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        const depthOf = (spanId: string): number => {
+            let depth = 0;
+            let cur: string | undefined = spanId;
+            const seen = new Set<string>();
+            while (cur && !seen.has(cur)) {
+                seen.add(cur);
+                const parent = parentOf.get(cur);
+                if (!parent) {
+                    break;
+                }
+                depth++;
+                cur = parent;
+            }
+            return depth;
+        };
+
+        const roots = buffer
+            .filter((span) => span.attributes[CoralogixAttributes.TRANSACTION_ROOT] === true)
+            .sort((a, b) => depthOf(b.spanContext().spanId) - depthOf(a.spanContext().spanId));
+
+        const batches: ReadableSpan[][] = [];
+        const extracted = new Set<string>();
+
+        for (const root of roots) {
+            const rootId = root.spanContext().spanId;
+            if (extracted.has(rootId) || hasLiveInSubtree(rootId)) {
+                continue;
+            }
+            const subtree = buffer.filter((span) => {
+                const spanId = span.spanContext().spanId;
+                if (extracted.has(spanId)) {
+                    return false;
+                }
+                return underRoot(spanId, rootId);
+            });
+            if (subtree.length === 0) {
+                continue;
+            }
+            for (const span of subtree) {
+                extracted.add(span.spanContext().spanId);
+            }
+            batches.push(subtree);
+        }
+
+        if (extracted.size > 0) {
+            const remaining = buffer.filter((span) => !extracted.has(span.spanContext().spanId));
+            if (remaining.length > 0) {
+                this.buffers.set(traceId, remaining);
+            } else {
+                this.buffers.delete(traceId);
+            }
+        }
+
+        if (flushLeftoverWhenIdle && live.size === 0) {
+            const leftover = this.buffers.get(traceId);
+            if (leftover && leftover.length > 0) {
+                this.buffers.delete(traceId);
+                batches.push(leftover);
+            }
+        }
+
+        return batches;
     }
 
     private async waitForIdle(timeoutMs = 30_000): Promise<void> {
@@ -301,12 +442,17 @@ export class TransactionSpanProcessor implements SpanProcessor {
             || span.kind === SpanKind.SERVER
             || span.kind === SpanKind.CONSUMER;
 
-        // Prefer a name already on the span (e.g. sampler Express template)
-        // over span.name so processor + sampler can be stacked safely.
         const existingName = asString(span.attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER]);
-        const transaction = startsNewTransaction
-            ? (existingName ?? span.name)
-            : (parentTransaction as string);
+        let transaction: string;
+        if (startsNewTransaction) {
+            if (existingName !== undefined && existingName !== parentTransaction) {
+                transaction = existingName;
+            } else {
+                transaction = span.name;
+            }
+        } else {
+            transaction = parentTransaction as string;
+        }
         const attributes: Attributes = {
             [CoralogixAttributes.TRANSACTION_IDENTIFIER]: transaction,
         };
@@ -317,11 +463,17 @@ export class TransactionSpanProcessor implements SpanProcessor {
         this.transactionsBySpan.set(spanKey(span.spanContext().traceId, span.spanContext().spanId), transaction);
     }
 
-    /**
-     * Resolve the parent's local transaction name from (in order): live parent
-     * span attributes, parent TraceState (non-recording / sampler path), then
-     * this processor's side table for spans we already tagged.
-     */
+    startNewTransaction(span: Span, name: string): void {
+        span.setAttributes({
+            [CoralogixAttributes.TRANSACTION_IDENTIFIER]: name,
+            [CoralogixAttributes.TRANSACTION_ROOT]: true,
+        });
+        const {traceId, spanId} = span.spanContext();
+        if (isSpanContextValid(span.spanContext())) {
+            this.transactionsBySpan.set(spanKey(traceId, spanId), name);
+        }
+    }
+
     private resolveParentTransaction(
         traceId: string,
         parentContext: Context,
@@ -355,41 +507,85 @@ export class TransactionSpanProcessor implements SpanProcessor {
         }
     }
 
-    /**
-     * Stamp self-time + metric on the full tree, trim to maxNodes, then harvest
-     * or export immediately when maxRegularTraces is 0 or harvestPeriodMillis <= 0.
-     */
     private acceptCompleted(spans: ReadableSpan[]): void {
-        this.stampSelfTimeAndMetrics(spans);
-
-        const rootSpanIds = spans
-            .filter((span) => span.attributes[CoralogixAttributes.TRANSACTION_ROOT] === true)
-            .map((span) => span.spanContext().spanId);
-        const trimmed = selectSlowestSpans(spans, this.maxNodes, rootSpanIds);
-        if (trimmed.length === 0) {
-            return;
+        const intervalSnapshot = new Map<string, Array<{startNs: bigint; endNs: bigint}>>();
+        for (const span of spans) {
+            const spanId = span.spanContext().spanId;
+            const intervals = this.childIntervals.get(spanId);
+            if (intervals && intervals.length > 0) {
+                intervalSnapshot.set(spanId, intervals.slice());
+            }
         }
 
-        // No harvest capacity, or no period (timer never scheduled): export now
-        // so traces cannot sit forever in the heap and be dropped on exit.
-        if (this.maxRegularTraces <= 0 || this.harvestPeriodMillis <= 0) {
-            this.exportSpans(trimmed);
-            return;
-        }
+        try {
+            this.stampSelfTimeAndMetrics(spans, intervalSnapshot);
 
-        this.harvest.witness({
-            durationNs: rootDurationNs(trimmed),
-            spans: trimmed,
-        });
+            const rootSpanIds = spans
+                .filter((span) => span.attributes[CoralogixAttributes.TRANSACTION_ROOT] === true)
+                .map((span) => span.spanContext().spanId);
+            const trimmed = selectSlowestSpans(spans, this.maxNodes, rootSpanIds);
+            if (trimmed.length === 0) {
+                return;
+            }
+
+            if (
+                this.maxRegularTraces <= 0
+                || this.harvestPeriodMillis <= 0
+                || this.stopped
+                || this.exporterShutdown
+            ) {
+                this.exportSpans(trimmed);
+                return;
+            }
+
+            this.harvest.witness({
+                durationNs: rootDurationNs(trimmed),
+                spans: trimmed,
+            });
+        } finally {
+            for (const span of spans) {
+                this.childIntervals.delete(span.spanContext().spanId);
+            }
+        }
     }
 
-    private stampSelfTimeAndMetrics(spans: ReadableSpan[]): void {
-        const rows: SpanTimingRow[] = spans.map((span) => ({
-            spanId: span.spanContext().spanId,
-            parentSpanId: span.parentSpanContext?.spanId,
-            startNs: hrTimeToBigIntNanos(span.startTime),
-            endNs: hrTimeToBigIntNanos(span.endTime),
-        }));
+    private stampSelfTimeAndMetrics(
+        spans: ReadableSpan[],
+        childIntervalSnapshot: Map<string, Array<{startNs: bigint; endNs: bigint}>>,
+    ): void {
+        const rows: SpanTimingRow[] = [];
+        for (const span of spans) {
+            const spanId = span.spanContext().spanId;
+            const startNs = hrTimeToBigIntNanos(span.startTime);
+            const endNs = hrTimeToBigIntNanos(span.endTime);
+            rows.push({
+                spanId,
+                parentSpanId: span.parentSpanContext?.spanId,
+                startNs,
+                endNs,
+            });
+            const priorIntervals = childIntervalSnapshot.get(spanId) ?? [];
+            for (let index = 0; index < priorIntervals.length; index++) {
+                const {startNs: priorStart, endNs: priorEnd} = priorIntervals[index]!;
+                const duplicateInBatch = spans.some((other) => {
+                    const otherParentId = other.parentSpanContext?.spanId;
+                    if (otherParentId !== spanId) {
+                        return false;
+                    }
+                    return hrTimeToBigIntNanos(other.startTime) === priorStart
+                        && hrTimeToBigIntNanos(other.endTime) === priorEnd;
+                });
+                if (duplicateInBatch) {
+                    continue;
+                }
+                rows.push({
+                    spanId: `${spanId}:prior:${index}`,
+                    parentSpanId: spanId,
+                    startNs: priorStart,
+                    endNs: priorEnd,
+                });
+            }
+        }
         const selfTimes = selfTimeNsBySpanId(rows);
 
         for (const span of spans) {
@@ -405,7 +601,9 @@ export class TransactionSpanProcessor implements SpanProcessor {
 
     private async flushHarvest(): Promise<void> {
         const winners = this.harvest.drain();
-        await Promise.all(winners.map(async (winner) => this.exportSpansAsync(winner.spans)));
+        for (const winner of winners) {
+            await this.exportSpansAsync(winner.spans);
+        }
     }
 
     private exportSpans(spans: ReadableSpan[]): void {
@@ -416,22 +614,40 @@ export class TransactionSpanProcessor implements SpanProcessor {
         if (spans.length === 0 || this.exporterShutdown) {
             return;
         }
-        const pending = new Promise<void>((resolve) => {
-            try {
-                this.exporter.export(spans, (result) => {
-                    if (result.error) {
-                        diag.warn("TransactionSpanProcessor: span export failed", result.error);
-                    }
-                    resolve();
-                });
-            } catch (error) {
-                diag.error("TransactionSpanProcessor failed to export spans", error);
-                resolve();
+        await this.runOnExportChain(async () => {
+            if (this.exporterShutdown || spans.length === 0) {
+                return;
             }
+            await new Promise<void>((resolve) => {
+                try {
+                    this.exporter.export(spans, (result) => {
+                        if (result.error) {
+                            diag.warn("TransactionSpanProcessor: span export failed", result.error);
+                        }
+                        resolve();
+                    });
+                } catch (error) {
+                    diag.error("TransactionSpanProcessor failed to export spans", error);
+                    resolve();
+                }
+            });
         });
+    }
+
+    private async runOnExportChain<T>(fn: () => T | Promise<T>): Promise<T> {
+        let result!: T;
+        const run = async (): Promise<void> => {
+            result = await fn();
+        };
+        const pending: Promise<void> = this.exportChain.then(run, run);
+        this.exportChain = pending.then(
+            () => undefined,
+            () => undefined,
+        );
         this.pendingExports.add(pending);
         try {
             await pending;
+            return result;
         } finally {
             this.pendingExports.delete(pending);
         }

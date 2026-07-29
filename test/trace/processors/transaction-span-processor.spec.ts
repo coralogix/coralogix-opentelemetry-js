@@ -491,6 +491,49 @@ export default describe('TransactionSpanProcessor', () => {
         await meterProvider.shutdown();
     });
 
+    it('exports nested SERVER transaction before outer ancestor ends', async () => {
+        const exporter = new StickySpanExporter();
+        const reader = new TestMetricReader();
+        const meterProvider = new MeterProvider({readers: [reader]});
+        const processor = new TransactionSpanProcessor(exporter, {
+            meterProvider,
+            maxRegularTraces: 0,
+            completionHoldbackMillis: 0,
+        });
+        const provider = new BasicTracerProvider({spanProcessors: [processor]});
+        const tracer = provider.getTracer('test');
+
+        let context: Context = ROOT_CONTEXT;
+        const outer = tracer.startSpan('worker.run', {startTime: [0, 0]}, context);
+        context = opentelemetry.trace.setSpan(context, outer);
+        const inboundServer = tracer.startSpan('POST /webhook', {
+            kind: SpanKind.SERVER,
+            startTime: [0, 10],
+        }, context);
+        context = opentelemetry.trace.setSpan(context, inboundServer);
+        const handler = tracer.startSpan('handle', {startTime: [0, 20]}, context);
+
+        handler.end([0, 80]);
+        inboundServer.end([0, 90]);
+
+        await provider.forceFlush();
+        let spans = exporter.getFinishedSpans();
+        assert.strictEqual(spans.length, 2, 'inner txn must export while outer is still live');
+        assert.ok(spans.some((s) => s.name === 'POST /webhook'));
+        assert.ok(spans.some((s) => s.name === 'handle'));
+        assert.ok(!spans.some((s) => s.name === 'worker.run'), 'outer must stay buffered until it ends');
+
+        outer.end([0, 100]);
+        await provider.forceFlush();
+        spans = exporter.getFinishedSpans();
+        assert.strictEqual(spans.length, 3, 'outer exports after it ends');
+        const outerSpan = spans.find((s) => s.name === 'worker.run')!;
+        assert.ok(CoralogixAttributes.SELF_TIME in outerSpan.attributes);
+
+        await provider.shutdown();
+        await meterProvider.shutdown();
+    });
+
     it('holdback keeps fire-and-forget children on the same local trace', async () => {
         const exporter = new StickySpanExporter();
         const reader = new TestMetricReader();
@@ -529,6 +572,180 @@ export default describe('TransactionSpanProcessor', () => {
         assert.ok(CoralogixAttributes.SELF_TIME in parentSpan.attributes);
 
         await provider.shutdown();
+        await meterProvider.shutdown();
+    });
+
+    it('outer ending before nested still finalizes nested and outer as separate txns', async () => {
+        // Outer ends while nested is live, so outer sits earlier in the buffer.
+        // On nested end (TraceID idle), extraction must process deepest-first:
+        // nested first, then outer without re-absorbing nested spans.
+        const exporter = new StickySpanExporter();
+        const reader = new TestMetricReader();
+        const meterProvider = new MeterProvider({readers: [reader]});
+        const processor = new TransactionSpanProcessor(exporter, {
+            meterProvider,
+            maxRegularTraces: 0,
+            completionHoldbackMillis: 0,
+        });
+        const provider = new BasicTracerProvider({spanProcessors: [processor]});
+        const tracer = provider.getTracer('test');
+
+        let context: Context = ROOT_CONTEXT;
+        const outer = tracer.startSpan('outer', {
+            kind: SpanKind.SERVER,
+            startTime: [0, 0],
+        }, context);
+        context = opentelemetry.trace.setSpan(context, outer);
+        const nested = tracer.startSpan('nested', {
+            kind: SpanKind.SERVER,
+            startTime: [0, 10],
+        }, context);
+        context = opentelemetry.trace.setSpan(context, nested);
+        const nestedChild = tracer.startSpan('nested-child', {startTime: [0, 20]}, context);
+
+        outer.end([0, 40]);
+        assert.strictEqual(
+            exporter.getFinishedSpans().length,
+            0,
+            'outer must stay buffered while nested subtree is still live',
+        );
+
+        nestedChild.end([0, 50]);
+        nested.end([0, 60]);
+        await provider.forceFlush();
+
+        const spans = exporter.getFinishedSpans();
+        assert.strictEqual(spans.length, 3, 'nested + outer must export as separate batches');
+        assert.ok(spans.some((s) => s.name === 'nested'));
+        assert.ok(spans.some((s) => s.name === 'nested-child'));
+        assert.ok(spans.some((s) => s.name === 'outer'));
+
+        const nestedRoot = spans.find((s) => s.name === 'nested')!;
+        const outerRoot = spans.find((s) => s.name === 'outer')!;
+        assert.strictEqual(nestedRoot.attributes[CoralogixAttributes.TRANSACTION_ROOT], true);
+        assert.strictEqual(outerRoot.attributes[CoralogixAttributes.TRANSACTION_ROOT], true);
+        assert.strictEqual(
+            nestedRoot.attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER],
+            'nested',
+        );
+        assert.strictEqual(
+            outerRoot.attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER],
+            'outer',
+        );
+
+        await provider.shutdown();
+        await meterProvider.shutdown();
+    });
+
+    it('shutdown exports completed traces immediately when harvest is enabled', async () => {
+        // Completing after stopped=true must export now, not witness into a
+        // harvest heap that shutdown may already have drained.
+        const exporter = new StickySpanExporter();
+        const reader = new TestMetricReader();
+        const meterProvider = new MeterProvider({readers: [reader]});
+        const processor = new TransactionSpanProcessor(exporter, {
+            meterProvider,
+            maxRegularTraces: 1,
+            harvestPeriodMillis: 60_000,
+            completionHoldbackMillis: 0,
+            shutdownIdleWaitMillis: 500,
+        });
+        const provider = new BasicTracerProvider({spanProcessors: [processor]});
+        const tracer = provider.getTracer('test');
+
+        const root = tracer.startSpan('late', {
+            kind: SpanKind.SERVER,
+            startTime: [0, 0],
+        });
+
+        const shutdownPromise = provider.shutdown();
+        await sleep(20);
+        root.end([0, 100_000_000]);
+        await shutdownPromise;
+
+        const spans = exporter.getFinishedSpans();
+        assert.strictEqual(
+            spans.length,
+            1,
+            'completed trace during shutdown must export, not be lost in harvest',
+        );
+        assert.strictEqual(spans[0]!.name, 'late');
+
+        await meterProvider.shutdown();
+    });
+
+    it('forceFlush finalizes idle buffered traces without a holdback timer', async () => {
+        // Nested extracts while outer is live; outer then ends with holdback=0
+        // (no timer). forceFlush must still scan idle buffers and finalize outer.
+        const exporter = new StickySpanExporter();
+        const reader = new TestMetricReader();
+        const meterProvider = new MeterProvider({readers: [reader]});
+        const processor = new TransactionSpanProcessor(exporter, {
+            meterProvider,
+            maxRegularTraces: 0,
+            completionHoldbackMillis: 0,
+        });
+        const provider = new BasicTracerProvider({spanProcessors: [processor]});
+        const tracer = provider.getTracer('test');
+
+        let context: Context = ROOT_CONTEXT;
+        const outer = tracer.startSpan('worker', {startTime: [0, 0]}, context);
+        context = opentelemetry.trace.setSpan(context, outer);
+        const nested = tracer.startSpan('POST /hook', {
+            kind: SpanKind.SERVER,
+            startTime: [0, 10],
+        }, context);
+        nested.end([0, 50]);
+
+        await provider.forceFlush();
+        assert.strictEqual(
+            exporter.getFinishedSpans().length,
+            1,
+            'nested SERVER must export while outer is still live',
+        );
+        assert.strictEqual(exporter.getFinishedSpans()[0]!.name, 'POST /hook');
+
+        outer.end([0, 80]);
+        await provider.forceFlush();
+        const spans = exporter.getFinishedSpans();
+        assert.strictEqual(spans.length, 2, 'forceFlush must finalize idle outer buffer');
+        assert.ok(spans.some((s) => s.name === 'worker'));
+
+        await provider.shutdown();
+        await meterProvider.shutdown();
+    });
+
+    it('holdback callback no-ops after exporter shutdown', async () => {
+        const exporter = new StickySpanExporter();
+        const reader = new TestMetricReader();
+        const meterProvider = new MeterProvider({readers: [reader]});
+        const processor = new TransactionSpanProcessor(exporter, {
+            meterProvider,
+            maxRegularTraces: 0,
+            completionHoldbackMillis: 80,
+            shutdownIdleWaitMillis: 10,
+        });
+        const provider = new BasicTracerProvider({spanProcessors: [processor]});
+        const tracer = provider.getTracer('test');
+
+        // Incomplete trace: child ended, parent still live → dropped on shutdown.
+        const root = tracer.startSpan('parent', {kind: SpanKind.SERVER, startTime: [0, 0]});
+        const rootCtx = opentelemetry.trace.setSpan(ROOT_CONTEXT, root);
+        const child = tracer.startSpan('child', {startTime: [0, 10]}, rootCtx);
+        child.end([0, 30]);
+
+        await provider.shutdown();
+        assert.strictEqual(exporter.getFinishedSpans().length, 0);
+
+        // Late end after exporter shutdown must not export (holdback must no-op).
+        root.end([0, 50]);
+        await sleep(120);
+        assert.strictEqual(
+            exporter.getFinishedSpans().length,
+            0,
+            'holdback after exporterShutdown must not export',
+        );
+
         await meterProvider.shutdown();
     });
 });
