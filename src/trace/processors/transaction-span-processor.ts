@@ -538,10 +538,13 @@ export class TransactionSpanProcessor implements SpanProcessor {
                 return;
             }
 
-            this.harvest.witness({
+            const stubs = this.harvest.witness({
                 durationNs: rootDurationNs(trimmed),
                 spans: trimmed,
             });
+            if (stubs.length > 0) {
+                this.exportSpans(stubs);
+            }
         } finally {
             for (const span of spans) {
                 this.childIntervals.delete(span.spanContext().spanId);

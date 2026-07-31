@@ -300,6 +300,7 @@ export default describe('TransactionSpanProcessor', () => {
             meterProvider,
             maxRegularTraces: 1,
             harvestPeriodMillis: 60_000,
+            completionHoldbackMillis: 0,
         });
         const provider = new BasicTracerProvider({spanProcessors: [processor]});
         const tracer = provider.getTracer('test');
@@ -316,13 +317,18 @@ export default describe('TransactionSpanProcessor', () => {
         });
         slow.end([2, 500_000_000]);
 
-        assert.strictEqual(exporter.getFinishedSpans().length, 0, 'harvest holds traces until flush');
+        await new Promise((resolve) => setImmediate(resolve));
+        const beforeFlush = exporter.getFinishedSpans();
+        assert.strictEqual(beforeFlush.length, 1, 'displaced fast loser must stub-export immediately');
+        assert.strictEqual(beforeFlush[0]!.name, 'fast');
 
         await provider.forceFlush();
         await meterProvider.forceFlush();
         const exported = exporter.getFinishedSpans();
-        assert.strictEqual(exported.length, 1);
-        assert.strictEqual(exported[0]!.name, 'slow');
+        assert.strictEqual(exported.length, 2, 'slowest full waterfall + stub root for the loser');
+        const names = new Set(exported.map((s) => s.name));
+        assert.ok(names.has('slow'));
+        assert.ok(names.has('fast'));
 
         const {resourceMetrics} = await reader.collect();
         const metricNames = resourceMetrics.scopeMetrics.flatMap((sm) =>

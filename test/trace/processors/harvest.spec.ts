@@ -6,6 +6,7 @@ import {resourceFromAttributes} from "@opentelemetry/resources";
 import {
     HarvestTrace,
     RegularTraceHeap,
+    harvestStubSpans,
     rootDurationNs,
 } from "../../../src/trace/processors/harvest";
 
@@ -56,26 +57,35 @@ export default describe("RegularTraceHeap", () => {
             durationNs: BigInt(500),
             spans: [makeSpan("slow", "2", 0, 500, true)],
         };
-        assert.strictEqual(heap.witness(fast), true);
-        assert.strictEqual(heap.witness(mid), true);
-        assert.strictEqual(heap.witness(slow), true);
+        assert.deepStrictEqual(heap.witness(fast), []);
+        assert.deepStrictEqual(heap.witness(mid).map((s) => s.name), ["fast"]);
+        assert.deepStrictEqual(heap.witness(slow).map((s) => s.name), ["mid"]);
         const winners = heap.drain();
         assert.strictEqual(winners.length, 1);
         assert.strictEqual(winners[0]!.durationNs, BigInt(500));
         assert.strictEqual(winners[0]!.spans[0]!.name, "slow");
     });
 
-    it("rejects faster than the current winner", () => {
+    it("rejects faster than the current winner with a stub", () => {
         const heap = new RegularTraceHeap(1);
-        assert.strictEqual(
+        assert.deepStrictEqual(
             heap.witness({durationNs: BigInt(500), spans: [makeSpan("slow", "1", 0, 500, true)]}),
-            true,
+            [],
         );
-        assert.strictEqual(
-            heap.witness({durationNs: BigInt(50), spans: [makeSpan("fast", "2", 0, 50, true)]}),
-            false,
+        assert.deepStrictEqual(
+            heap.witness({durationNs: BigInt(50), spans: [makeSpan("fast", "2", 0, 50, true)]}).map((s) => s.name),
+            ["fast"],
         );
         assert.strictEqual(heap.drain()[0]!.spans[0]!.name, "slow");
+    });
+
+    it("harvestStubSpans prefers the transaction root", () => {
+        const stubs = harvestStubSpans([
+            makeSpan("child", "2", 0, 999),
+            makeSpan("root", "1", 0, 100, true),
+        ]);
+        assert.strictEqual(stubs.length, 1);
+        assert.strictEqual(stubs[0]!.name, "root");
     });
 
     it("rootDurationNs prefers the transaction root", () => {

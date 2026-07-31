@@ -38,22 +38,22 @@ export class RegularTraceHeap {
         return this.heap.length;
     }
 
-    witness(trace: HarvestTrace): boolean {
+    witness(trace: HarvestTrace): ReadableSpan[] {
         if (this.maxTraces <= 0) {
-            return false;
+            return [];
         }
         if (this.heap.length < this.maxTraces) {
             this.heap.push(trace);
             this.siftUp(this.heap.length - 1);
-            return true;
+            return [];
         }
         const head = this.heap[0];
         if (head === undefined || trace.durationNs <= head.durationNs) {
-            return false;
+            return harvestStubSpans(trace.spans);
         }
         this.heap[0] = trace;
         this.siftDown(0);
-        return true;
+        return harvestStubSpans(head.spans);
     }
 
     drain(): HarvestTrace[] {
@@ -126,4 +126,28 @@ export function rootDurationNs(spans: ReadableSpan[]): bigint {
         return maxRootDuration;
     }
     return maxDuration;
+}
+
+/** Root-only spans for APM presence when a completed tree loses harvest. */
+export function harvestStubSpans(spans: ReadableSpan[]): ReadableSpan[] {
+    if (spans.length === 0) {
+        return [];
+    }
+    const stubs = spans.filter(
+        (span) => span.attributes[CoralogixAttributes.TRANSACTION_ROOT] === true,
+    );
+    if (stubs.length > 0) {
+        return stubs;
+    }
+    let best = spans[0]!;
+    let bestDur = spanDurationNs(best);
+    for (let i = 1; i < spans.length; i++) {
+        const span = spans[i]!;
+        const duration = spanDurationNs(span);
+        if (duration > bestDur) {
+            best = span;
+            bestDur = duration;
+        }
+    }
+    return [best];
 }
