@@ -68,6 +68,8 @@ export class TransactionSpanProcessor implements SpanProcessor {
     private harvestTimer: ReturnType<typeof setInterval> | undefined;
     /** traceId -> holdback timer after last live span ended */
     private readonly pendingCompletions = new Map<string, ReturnType<typeof setTimeout>>();
+    /** traceId -> holdback timer while outer ancestors are still live but a nested txn completed */
+    private readonly pendingNestedCompletions = new Map<string, ReturnType<typeof setTimeout>>();
     /** parentSpanId -> ended direct-child intervals kept for outer self-time after nested txn export */
     private readonly childIntervals = new Map<string, Array<{startNs: bigint; endNs: bigint}>>();
     /** In-flight exporter.export promises; forceFlush/shutdown wait for these. */
@@ -151,7 +153,10 @@ export class TransactionSpanProcessor implements SpanProcessor {
         }
 
         const parentId = span.parentSpanContext?.spanId;
-        if (parentId) {
+        const buffer = this.buffers.get(traceId) ?? [];
+        // Only retain intervals for parents we track locally. Remote / external
+        // parent IDs are never cleaned by acceptCompleted and would leak.
+        if (parentId && this.isLocalParent(traceId, parentId, live, buffer)) {
             const intervals = this.childIntervals.get(parentId) ?? [];
             intervals.push({
                 startNs: hrTimeToBigIntNanos(span.startTime),
@@ -160,7 +165,6 @@ export class TransactionSpanProcessor implements SpanProcessor {
             this.childIntervals.set(parentId, intervals);
         }
 
-        const buffer = this.buffers.get(traceId) ?? [];
         buffer.push(span);
         this.buffers.set(traceId, buffer);
 
@@ -173,10 +177,10 @@ export class TransactionSpanProcessor implements SpanProcessor {
 
         const stillLive = this.liveParents.get(traceId);
         if (stillLive && stillLive.size > 0) {
-            const batches = this.extractCompletedLocalTransactions(traceId);
-            for (const batch of batches) {
-                this.acceptCompleted(batch);
-            }
+            // Nested local txn finished while an outer ancestor is still live:
+            // apply the same completion holdback so fire-and-forget children
+            // started from that nested root can join the batch.
+            this.scheduleNestedCompletion(traceId);
             return;
         }
 
@@ -255,6 +259,26 @@ export class TransactionSpanProcessor implements SpanProcessor {
         }
     }
 
+    private cancelPendingNestedCompletion(traceId: string): void {
+        const timer = this.pendingNestedCompletions.get(traceId);
+        if (timer !== undefined) {
+            clearTimeout(timer);
+            this.pendingNestedCompletions.delete(traceId);
+        }
+    }
+
+    private isLocalParent(
+        _traceId: string,
+        parentId: string,
+        live: Map<string, string | undefined> | undefined,
+        buffer: ReadableSpan[],
+    ): boolean {
+        if (live?.has(parentId)) {
+            return true;
+        }
+        return buffer.some((s) => s.spanContext().spanId === parentId);
+    }
+
     private scheduleCompletion(traceId: string): void {
         this.cancelPendingCompletion(traceId);
         if (this.exporterShutdown) {
@@ -277,13 +301,122 @@ export class TransactionSpanProcessor implements SpanProcessor {
         this.pendingCompletions.set(traceId, timer);
     }
 
+    private scheduleNestedCompletion(traceId: string): void {
+        if (!this.hasExtractableNestedTransaction(traceId)) {
+            this.cancelPendingNestedCompletion(traceId);
+            return;
+        }
+        if (this.pendingNestedCompletions.has(traceId)) {
+            // Already armed; do not reset on unrelated outer activity.
+            return;
+        }
+        if (this.exporterShutdown) {
+            return;
+        }
+        if (this.completionHoldbackMillis <= 0) {
+            this.finalizeNestedCompleted(traceId);
+            return;
+        }
+        const timer = setTimeout(() => {
+            if (this.exporterShutdown) {
+                return;
+            }
+            if (this.pendingNestedCompletions.get(traceId) !== timer) {
+                return;
+            }
+            this.pendingNestedCompletions.delete(traceId);
+            this.finalizeNestedCompleted(traceId);
+            // Timer may have fired while a late child was still live under the nested
+            // root; re-arm once that subtree is idle again.
+            if (this.hasExtractableNestedTransaction(traceId)) {
+                this.scheduleNestedCompletion(traceId);
+            }
+        }, this.completionHoldbackMillis);
+        this.pendingNestedCompletions.set(traceId, timer);
+    }
+
+    private hasExtractableNestedTransaction(traceId: string): boolean {
+        const buffer = this.buffers.get(traceId);
+        if (!buffer || buffer.length === 0) {
+            return false;
+        }
+        const live = this.liveParents.get(traceId) ?? new Map<string, string | undefined>();
+        if (live.size === 0) {
+            return false;
+        }
+        const parentOf = new Map<string, string>();
+        for (const span of buffer) {
+            const parentId = span.parentSpanContext?.spanId;
+            if (parentId) {
+                parentOf.set(span.spanContext().spanId, parentId);
+            }
+        }
+        for (const [spanId, parentId] of live) {
+            if (parentId) {
+                parentOf.set(spanId, parentId);
+            }
+        }
+        const underRoot = (spanId: string, rootId: string): boolean => {
+            const seen = new Set<string>();
+            let cur: string | undefined = spanId;
+            while (cur && !seen.has(cur)) {
+                if (cur === rootId) {
+                    return true;
+                }
+                seen.add(cur);
+                cur = parentOf.get(cur);
+            }
+            return false;
+        };
+        const hasLiveInSubtree = (rootId: string): boolean => {
+            if (live.has(rootId)) {
+                return true;
+            }
+            for (const liveId of live.keys()) {
+                if (underRoot(liveId, rootId)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        for (const span of buffer) {
+            if (span.attributes[CoralogixAttributes.TRANSACTION_ROOT] !== true) {
+                continue;
+            }
+            const rootId = span.spanContext().spanId;
+            if (!hasLiveInSubtree(rootId)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private finalizeNestedCompleted(traceId: string): void {
+        if (this.exporterShutdown) {
+            return;
+        }
+        const live = this.liveParents.get(traceId);
+        if (!live || live.size === 0) {
+            // Whole trace idle — let the normal idle path own finalization.
+            return;
+        }
+        const batches = this.extractCompletedLocalTransactions(traceId);
+        for (const batch of batches) {
+            this.acceptCompleted(batch);
+        }
+    }
+
     private flushPendingCompletions(): void {
         for (const traceId of [...this.pendingCompletions.keys()]) {
             this.cancelPendingCompletion(traceId);
         }
+        for (const traceId of [...this.pendingNestedCompletions.keys()]) {
+            this.cancelPendingNestedCompletion(traceId);
+        }
         for (const traceId of [...this.buffers.keys()]) {
             const live = this.liveParents.get(traceId);
             if (live && live.size > 0) {
+                this.finalizeNestedCompleted(traceId);
                 continue;
             }
             this.finalizeTraceIfIdle(traceId);

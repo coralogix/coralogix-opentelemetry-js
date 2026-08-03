@@ -2,7 +2,7 @@ import {describe, it} from "node:test";
 import assert from "node:assert";
 import {setTimeout as sleep} from "node:timers/promises";
 import * as opentelemetry from "@opentelemetry/api";
-import {Context, ROOT_CONTEXT, SpanKind} from "@opentelemetry/api";
+import {Context, ROOT_CONTEXT, SpanContext, SpanKind} from "@opentelemetry/api";
 import {
     BasicTracerProvider,
     InMemorySpanExporter,
@@ -576,6 +576,102 @@ export default describe('TransactionSpanProcessor', () => {
         // parent [0,40], child [50,80] does not overlap parent → self-time = full 40ns... 
         // wait times are [sec, ns] - [0,40] means 40 nanoseconds
         assert.ok(CoralogixAttributes.SELF_TIME in parentSpan.attributes);
+
+        await provider.shutdown();
+        await meterProvider.shutdown();
+    });
+
+    it('nested holdback keeps fire-and-forget children under nested SERVER', async () => {
+        const exporter = new StickySpanExporter();
+        const reader = new TestMetricReader();
+        const meterProvider = new MeterProvider({readers: [reader]});
+        const processor = new TransactionSpanProcessor(exporter, {
+            meterProvider,
+            maxRegularTraces: 0,
+            completionHoldbackMillis: 50,
+        });
+        const provider = new BasicTracerProvider({spanProcessors: [processor]});
+        const tracer = provider.getTracer('test');
+
+        let context: Context = ROOT_CONTEXT;
+        const outer = tracer.startSpan('worker.run', {startTime: [0, 0]}, context);
+        context = opentelemetry.trace.setSpan(context, outer);
+        const nested = tracer.startSpan('POST /webhook', {
+            kind: SpanKind.SERVER,
+            startTime: [0, 10],
+        }, context);
+        const nestedCtx = opentelemetry.trace.setSpan(context, nested);
+        nested.end([0, 40]);
+
+        await sleep(5);
+        assert.strictEqual(
+            exporter.getFinishedSpans().length,
+            0,
+            'nested must wait for holdback while outer is live',
+        );
+
+        const late = tracer.startSpan('async-nested-child', {startTime: [0, 50]}, nestedCtx);
+        late.end([0, 80]);
+
+        await sleep(60);
+        let spans = exporter.getFinishedSpans();
+        assert.ok(spans.some((s) => s.name === 'POST /webhook'));
+        assert.ok(
+            spans.some((s) => s.name === 'async-nested-child'),
+            'late child under nested root must join the nested batch',
+        );
+        assert.ok(!spans.some((s) => s.name === 'worker.run'), 'outer must stay buffered');
+
+        outer.end([0, 100]);
+        await provider.forceFlush();
+        spans = exporter.getFinishedSpans();
+        assert.ok(spans.some((s) => s.name === 'worker.run'));
+
+        await provider.shutdown();
+        await meterProvider.shutdown();
+    });
+
+    it('integration: remote parent does not leak childIntervals', async () => {
+        const exporter = new StickySpanExporter();
+        const reader = new TestMetricReader();
+        const meterProvider = new MeterProvider({readers: [reader]});
+        const processor = new TransactionSpanProcessor(exporter, {
+            meterProvider,
+            maxRegularTraces: 0,
+            completionHoldbackMillis: 0,
+        });
+        const provider = new BasicTracerProvider({spanProcessors: [processor]});
+        const tracer = provider.getTracer('test');
+
+        const remoteParent: SpanContext = {
+            traceId: '00000000000000000000000000000001',
+            spanId: 'ffffffffffffffff',
+            traceFlags: 1,
+            isRemote: true,
+        };
+        const remoteContext = opentelemetry.trace.setSpanContext(ROOT_CONTEXT, remoteParent);
+
+        for (let i = 0; i < 5; i++) {
+            const root = tracer.startSpan(`GET /item/${i}`, {
+                kind: SpanKind.SERVER,
+                startTime: [0, i * 100],
+            }, remoteContext);
+            root.end([0, i * 100 + 50]);
+        }
+        await provider.forceFlush();
+        assert.strictEqual(exporter.getFinishedSpans().length, 5);
+
+        // Peek private map via acceptCompleted cleanup: another local child under a
+        // local parent should still record intervals; remote parents must not accumulate.
+        const intervals = (processor as unknown as {
+            childIntervals: Map<string, unknown[]>;
+        }).childIntervals;
+        assert.strictEqual(
+            intervals.has('ffffffffffffffff'),
+            false,
+            'remote parent span id must not retain childIntervals',
+        );
+        assert.strictEqual(intervals.size, 0, 'acceptCompleted must clear local interval keys');
 
         await provider.shutdown();
         await meterProvider.shutdown();

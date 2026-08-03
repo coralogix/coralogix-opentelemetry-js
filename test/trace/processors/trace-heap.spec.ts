@@ -96,6 +96,33 @@ export default describe("selectSlowestSpans", () => {
         assert.strictEqual(db.parentSpanContext?.spanId, ROOT);
     });
 
+    it("preserves remote / external parent on a kept root while trimming", () => {
+        const remoteParentId = "ffffffffffffffff";
+        const spans = [
+            makeSpan({
+                name: "root",
+                spanId: ROOT,
+                startNs: 0,
+                endNs: 200,
+                parentSpanId: remoteParentId,
+                root: true,
+            }),
+            makeSpan({name: "auth", spanId: AUTH, startNs: 1, endNs: 6, parentSpanId: ROOT}),
+            makeSpan({name: "cache", spanId: CACHE, startNs: 10, endNs: 12, parentSpanId: ROOT}),
+            makeSpan({name: "db", spanId: DB_LONG, startNs: 20, endNs: 60, parentSpanId: ROOT}),
+            makeSpan({name: "http", spanId: HTTP, startNs: 70, endNs: 150, parentSpanId: ROOT}),
+            makeSpan({name: "render", spanId: RENDER, startNs: 160, endNs: 170, parentSpanId: ROOT}),
+        ];
+        // Mark root's parent as remote-style: parent exists in parentSpanContext but not in allSpans.
+        const kept = selectSlowestSpans(spans, 3, ROOT);
+        const root = kept.find((s) => s.name === "root")!;
+        assert.strictEqual(
+            root.parentSpanContext?.spanId,
+            remoteParentId,
+            "trimmed export must keep the external parent link",
+        );
+    });
+
     it("protects every transaction root when maxNodes is tight", () => {
         const rootA = "0000000000000001";
         const rootB = "0000000000000002";

@@ -158,7 +158,8 @@ function nearestKeptParent(
         }
         const ancestor = byId.get(parent.spanId);
         if (ancestor === undefined) {
-            break;
+            // Parent is outside this local batch (e.g. remote). Preserve it.
+            return parent;
         }
         parent = ancestor.parentSpanContext;
     }
