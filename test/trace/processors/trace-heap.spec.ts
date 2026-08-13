@@ -68,7 +68,7 @@ export default describe("selectSlowestSpans", () => {
             makeSpan({name: "root", spanId: ROOT, startNs: 0, endNs: 100, root: true}),
             makeSpan({name: "a", spanId: A, startNs: 10, endNs: 20, parentSpanId: ROOT}),
         ];
-        assert.strictEqual(selectSlowestSpans(spans, 256, ROOT).length, 2);
+        assert.strictEqual(selectSlowestSpans(spans, 256, [ROOT]).length, 2);
     });
 
     it("keeps longest and always keeps root", () => {
@@ -80,7 +80,7 @@ export default describe("selectSlowestSpans", () => {
             makeSpan({name: "http", spanId: HTTP, startNs: 70, endNs: 150, parentSpanId: ROOT}),
             makeSpan({name: "render", spanId: RENDER, startNs: 160, endNs: 170, parentSpanId: ROOT}),
         ];
-        const kept = selectSlowestSpans(spans, 3, ROOT);
+        const kept = selectSlowestSpans(spans, 3, [ROOT]);
         assert.deepStrictEqual(new Set(kept.map((s) => s.name)), new Set(["root", "db", "http"]));
     });
 
@@ -90,7 +90,7 @@ export default describe("selectSlowestSpans", () => {
             makeSpan({name: "middleware", spanId: MID, startNs: 1, endNs: 2, parentSpanId: ROOT}),
             makeSpan({name: "db", spanId: DB, startNs: 5, endNs: 90, parentSpanId: MID}),
         ];
-        const kept = selectSlowestSpans(spans, 2, ROOT);
+        const kept = selectSlowestSpans(spans, 2, [ROOT]);
         assert.deepStrictEqual(new Set(kept.map((s) => s.name)), new Set(["root", "db"]));
         const db = kept.find((s) => s.name === "db")!;
         assert.strictEqual(db.parentSpanContext?.spanId, ROOT);
@@ -114,7 +114,7 @@ export default describe("selectSlowestSpans", () => {
             makeSpan({name: "render", spanId: RENDER, startNs: 160, endNs: 170, parentSpanId: ROOT}),
         ];
         // Mark root's parent as remote-style: parent exists in parentSpanContext but not in allSpans.
-        const kept = selectSlowestSpans(spans, 3, ROOT);
+        const kept = selectSlowestSpans(spans, 3, [ROOT]);
         const root = kept.find((s) => s.name === "root")!;
         assert.strictEqual(
             root.parentSpanContext?.spanId,

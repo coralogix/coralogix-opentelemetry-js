@@ -2,15 +2,18 @@
  * Harvest heap: keep only the slowest completed local traces.
  * During a harvest window, completed local traces compete by root duration;
  * only winners are exported (default capacity 1).
+ *
+ * Backing structure is a min-heap by duration: head = shortest / easiest to
+ * displace when a longer trace arrives.
  */
 
 import {ReadableSpan} from "@opentelemetry/sdk-trace-base";
 import {CoralogixAttributes} from "../common";
+import {DEFAULT_MAX_REGULAR_TRACES} from "./defaults";
+import {bubbleDown, bubbleUp} from "./min-heap";
 import {spanDurationNs} from "./trace-heap";
 
-/** Default harvest capacity and period. */
-export const DEFAULT_MAX_REGULAR_TRACES = 1;
-export const DEFAULT_HARVEST_PERIOD_MILLIS = 60_000;
+export {DEFAULT_MAX_REGULAR_TRACES, DEFAULT_HARVEST_PERIOD_MILLIS} from "./defaults";
 
 const ZERO = BigInt(0);
 
@@ -44,7 +47,8 @@ export class RegularTraceHeap {
         }
         if (this.heap.length < this.maxTraces) {
             this.heap.push(trace);
-            this.siftUp(this.heap.length - 1);
+            // Min-heap by duration: shorter traces sit toward the head.
+            bubbleUp(this.heap, this.heap.length - 1, durationLess);
             return [];
         }
         const head = this.heap[0];
@@ -52,7 +56,7 @@ export class RegularTraceHeap {
             return harvestStubSpans(trace.spans);
         }
         this.heap[0] = trace;
-        this.siftDown(0);
+        bubbleDown(this.heap, 0, durationLess);
         return harvestStubSpans(head.spans);
     }
 
@@ -61,48 +65,10 @@ export class RegularTraceHeap {
         this.heap.length = 0;
         return traces;
     }
+}
 
-    private siftUp(i: number): void {
-        let cur = i;
-        while (cur > 0) {
-            const p = (cur - 1) >> 1;
-            const child = this.heap[cur];
-            const parent = this.heap[p];
-            if (child === undefined || parent === undefined || child.durationNs >= parent.durationNs) {
-                break;
-            }
-            this.heap[cur] = parent;
-            this.heap[p] = child;
-            cur = p;
-        }
-    }
-
-    private siftDown(i: number): void {
-        let cur = i;
-        for (;;) {
-            let smallest = cur;
-            const l = cur * 2 + 1;
-            const r = l + 1;
-            const left = this.heap[l];
-            const right = this.heap[r];
-            const smallestItem = this.heap[smallest];
-            if (left !== undefined && smallestItem !== undefined && left.durationNs < smallestItem.durationNs) {
-                smallest = l;
-            }
-            const newSmallest = this.heap[smallest];
-            if (right !== undefined && newSmallest !== undefined && right.durationNs < newSmallest.durationNs) {
-                smallest = r;
-            }
-            if (smallest === cur) {
-                break;
-            }
-            const a = this.heap[cur]!;
-            const b = this.heap[smallest]!;
-            this.heap[cur] = b;
-            this.heap[smallest] = a;
-            cur = smallest;
-        }
-    }
+function durationLess(a: HarvestTrace, b: HarvestTrace): boolean {
+    return a.durationNs < b.durationNs;
 }
 
 /** Duration of the longest transaction root, else max span duration in the batch. */

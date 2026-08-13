@@ -1,64 +1,90 @@
 import {
-    Attributes,
-    AttributeValue,
     Context,
     diag,
     Histogram,
     isSpanContextValid,
     MeterProvider,
     metrics,
-    SpanKind,
     trace,
 } from "@opentelemetry/api";
 import {ReadableSpan, Span, SpanExporter, SpanProcessor} from "@opentelemetry/sdk-trace-base";
-import {CoralogixAttributes, CoralogixTraceState} from "../common";
+import {CoralogixAttributes} from "../common";
+import {DEFAULT_SHUTDOWN_IDLE_WAIT_MILLIS} from "./defaults";
+import {resolveProcessorOptions} from "./env-options";
 import {
-    DEFAULT_HARVEST_PERIOD_MILLIS,
-    DEFAULT_MAX_REGULAR_TRACES,
     RegularTraceHeap,
     rootDurationNs,
 } from "./harvest";
-import {selfTimeNsBySpanId, SpanTimingRow} from "./self-time";
-import {DEFAULT_MAX_TXN_TRACE_NODES, selectSlowestSpans} from "./trace-heap";
+import {stampSelfDurationAndMetrics} from "./self-duration-stamp";
+import {selectSlowestSpans} from "./trace-heap";
+import {
+    extractCompletedLocalTransactions,
+    hasExtractableNestedTransaction,
+} from "./transaction-extract";
+import {TransactionMembershipTracker} from "./transaction-membership";
 
-const METRIC_ATTR_SPAN_NAME = "span.name";
 const INSTRUMENTATION_SCOPE_NAME = "coralogix.opentelemetry.transaction";
 
 export interface TransactionSpanProcessorOptions {
-    /** MeterProvider used to create the self-time histogram. Defaults to the global MeterProvider. */
+    /** MeterProvider used to create the self-duration histogram. Defaults to the global MeterProvider. */
     meterProvider?: MeterProvider;
     /**
      * Keep at most this many spans per completed local trace (slowest first;
      * transaction root always kept). Default 256.
+     * Env: `OTEL_CX_TRANSACTION_MAX_NODES`.
      */
     maxNodes?: number;
     /**
      * Keep only the slowest completed local trace(s) until harvest.
-     * Default 1. Set to 0 to export every completed trace immediately.
+     * Default 1. Losers export as root-only stubs; self-duration metrics are
+     * still recorded for every completed local trace.
+     * Set to 0 to export every completed trimmed trace immediately.
+     * Env: `OTEL_CX_TRANSACTION_MAX_REGULAR_TRACES`.
      */
     maxRegularTraces?: number;
-    /** Harvest flush interval in milliseconds. Default 60_000. Values <= 0 export every completed trace immediately (no heap). */
+    /**
+     * Harvest flush interval in milliseconds. Default 60_000.
+     * Values <= 0 export every completed trace immediately (no heap).
+     * Env: `OTEL_CX_TRANSACTION_HARVEST_PERIOD_MILLIS`.
+     */
     harvestPeriodMillis?: number;
     /**
      * After the last live span in a local trace ends, wait this long before
      * finalizing so fire-and-forget children that start on the same traceId
      * can still join. Default 100. Set to 0 to finalize immediately.
+     * Env: `OTEL_CX_TRANSACTION_COMPLETION_HOLDBACK_MILLIS`.
      */
     completionHoldbackMillis?: number;
     /** How long shutdown waits for in-flight spans. Default 30_000. */
     shutdownIdleWaitMillis?: number;
 }
 
-export const DEFAULT_COMPLETION_HOLDBACK_MILLIS = 100;
+export {
+    DEFAULT_COMPLETION_HOLDBACK_MILLIS,
+    DEFAULT_HARVEST_PERIOD_MILLIS,
+    DEFAULT_MAX_REGULAR_TRACES,
+    DEFAULT_MAX_TXN_TRACE_NODES,
+} from "./defaults";
 
+/**
+ * Tags Coralogix transactions, stamps exclusive self duration, trims nodes,
+ * and optionally harvests the slowest completed local traces.
+ *
+ * Flow:
+ * - **onStart**: track live spans; decide new vs inherit transaction; set
+ *   `cgx.transaction.root` for new txns. Does not freeze `cgx.transaction`
+ *   from the early span name (Express may rename later).
+ * - **onEnd / holdback**: buffer until the local transaction subtree is idle.
+ * - **acceptCompleted (export finalize)**: stamp final `cgx.transaction` from
+ *   `overrideName ?? rootSpan.name`, then self duration + metrics, trim, harvest.
+ */
 export class TransactionSpanProcessor implements SpanProcessor {
     private readonly exporter: SpanExporter;
     private readonly buffers = new Map<string, ReadableSpan[]>();
     /** traceId -> (spanId -> parentSpanId) for still-running spans */
     private readonly liveParents = new Map<string, Map<string, string | undefined>>();
-    /** `${traceId}:${spanId}` -> transaction name for parents that are non-recording / attribute-less */
-    private readonly transactionsBySpan = new Map<string, string>();
-    private readonly selfTimeHistogram: Histogram;
+    private readonly membership = new TransactionMembershipTracker();
+    private readonly selfDurationHistogram: Histogram;
     private readonly maxNodes: number;
     private readonly maxRegularTraces: number;
     private readonly harvest: RegularTraceHeap;
@@ -70,7 +96,7 @@ export class TransactionSpanProcessor implements SpanProcessor {
     private readonly pendingCompletions = new Map<string, ReturnType<typeof setTimeout>>();
     /** traceId -> holdback timer while outer ancestors are still live but a nested txn completed */
     private readonly pendingNestedCompletions = new Map<string, ReturnType<typeof setTimeout>>();
-    /** parentSpanId -> ended direct-child intervals kept for outer self-time after nested txn export */
+    /** parentSpanId -> ended direct-child intervals kept for outer self-duration after nested txn export */
     private readonly childIntervals = new Map<string, Array<{startNs: bigint; endNs: bigint}>>();
     /** In-flight exporter.export promises; forceFlush/shutdown wait for these. */
     private readonly pendingExports = new Set<Promise<void>>();
@@ -82,14 +108,15 @@ export class TransactionSpanProcessor implements SpanProcessor {
 
     constructor(exporter: SpanExporter, options: TransactionSpanProcessorOptions = {}) {
         this.exporter = exporter;
-        this.maxNodes = options.maxNodes ?? DEFAULT_MAX_TXN_TRACE_NODES;
-        this.maxRegularTraces = options.maxRegularTraces ?? DEFAULT_MAX_REGULAR_TRACES;
-        this.harvestPeriodMillis = options.harvestPeriodMillis ?? DEFAULT_HARVEST_PERIOD_MILLIS;
-        this.completionHoldbackMillis = options.completionHoldbackMillis ?? DEFAULT_COMPLETION_HOLDBACK_MILLIS;
-        this.shutdownIdleWaitMillis = options.shutdownIdleWaitMillis ?? 30_000;
+        const resolved = resolveProcessorOptions(options);
+        this.maxNodes = resolved.maxNodes;
+        this.maxRegularTraces = resolved.maxRegularTraces;
+        this.harvestPeriodMillis = resolved.harvestPeriodMillis;
+        this.completionHoldbackMillis = resolved.completionHoldbackMillis;
+        this.shutdownIdleWaitMillis = options.shutdownIdleWaitMillis ?? DEFAULT_SHUTDOWN_IDLE_WAIT_MILLIS;
         this.harvest = new RegularTraceHeap(this.maxRegularTraces);
         const meter = (options.meterProvider ?? metrics.getMeterProvider()).getMeter(INSTRUMENTATION_SCOPE_NAME);
-        this.selfTimeHistogram = meter.createHistogram(CoralogixAttributes.SELF_TIME, {
+        this.selfDurationHistogram = meter.createHistogram(CoralogixAttributes.SELF_DURATION, {
             unit: "s",
             description: "Exclusive (self) wall time per span within a Coralogix transaction",
         });
@@ -105,15 +132,22 @@ export class TransactionSpanProcessor implements SpanProcessor {
         }
     }
 
+    /**
+     * Start path: track membership (new vs inherit) and live parent map.
+     * Transaction display name is finalized at export, not here.
+     */
     onStart(span: Span, parentContext: Context): void {
         if (!isSpanContextValid(span.spanContext())) {
             return;
         }
 
         try {
-            this.applyTransactionAttributes(span, parentContext);
+            this.membership.trackOnStart(span, parentContext);
         } catch (error) {
-            diag.debug("TransactionSpanProcessor: failed to resolve transaction attributes, leaving span untagged", error);
+            diag.debug(
+                "TransactionSpanProcessor: failed to track transaction membership, leaving span untagged",
+                error,
+            );
         }
 
         if (this.exporterShutdown) {
@@ -156,7 +190,7 @@ export class TransactionSpanProcessor implements SpanProcessor {
         const buffer = this.buffers.get(traceId) ?? [];
         // Only retain intervals for parents we track locally. Remote / external
         // parent IDs are never cleaned by acceptCompleted and would leak.
-        if (parentId && this.isLocalParent(traceId, parentId, live, buffer)) {
+        if (parentId && this.isLocalParent(parentId, live, buffer)) {
             const intervals = this.childIntervals.get(parentId) ?? [];
             intervals.push({
                 startNs: hrTimeToBigIntNanos(span.startTime),
@@ -213,6 +247,11 @@ export class TransactionSpanProcessor implements SpanProcessor {
         return this.shutdownPromise;
     }
 
+    /** Explicit API: force this span to be a transaction root with a fixed name. */
+    startNewTransaction(span: Span, name: string): void {
+        this.membership.startNewTransaction(span, name);
+    }
+
     private async doShutdown(): Promise<void> {
         this.stopped = true;
         if (this.harvestTimer !== undefined) {
@@ -232,21 +271,21 @@ export class TransactionSpanProcessor implements SpanProcessor {
                 for (const span of dropped) {
                     this.childIntervals.delete(span.spanContext().spanId);
                 }
-                this.clearTransactionsForTrace(traceId);
+                this.membership.clearTrace(traceId);
                 continue;
             }
-            const batches = this.extractCompletedLocalTransactions(traceId, true);
+            const batches = this.extractCompleted(traceId, true);
             for (const batch of batches) {
                 this.acceptCompleted(batch);
             }
-            this.clearTransactionsForTrace(traceId);
+            this.membership.clearTrace(traceId);
         }
         this.buffers.clear();
         this.liveParents.clear();
         await this.flushHarvest();
         await this.awaitPendingExports();
         this.exporterShutdown = true;
-        this.transactionsBySpan.clear();
+        this.membership.clear();
         this.childIntervals.clear();
         await this.runOnExportChain(async () => this.exporter.shutdown());
     }
@@ -268,7 +307,6 @@ export class TransactionSpanProcessor implements SpanProcessor {
     }
 
     private isLocalParent(
-        _traceId: string,
         parentId: string,
         live: Map<string, string | undefined> | undefined,
         buffer: ReadableSpan[],
@@ -302,7 +340,9 @@ export class TransactionSpanProcessor implements SpanProcessor {
     }
 
     private scheduleNestedCompletion(traceId: string): void {
-        if (!this.hasExtractableNestedTransaction(traceId)) {
+        const buffer = this.buffers.get(traceId) ?? [];
+        const live = this.liveParents.get(traceId) ?? new Map<string, string | undefined>();
+        if (!hasExtractableNestedTransaction(buffer, live)) {
             this.cancelPendingNestedCompletion(traceId);
             return;
         }
@@ -328,67 +368,13 @@ export class TransactionSpanProcessor implements SpanProcessor {
             this.finalizeNestedCompleted(traceId);
             // Timer may have fired while a late child was still live under the nested
             // root; re-arm once that subtree is idle again.
-            if (this.hasExtractableNestedTransaction(traceId)) {
+            const buf = this.buffers.get(traceId) ?? [];
+            const liveAfter = this.liveParents.get(traceId) ?? new Map<string, string | undefined>();
+            if (hasExtractableNestedTransaction(buf, liveAfter)) {
                 this.scheduleNestedCompletion(traceId);
             }
         }, this.completionHoldbackMillis);
         this.pendingNestedCompletions.set(traceId, timer);
-    }
-
-    private hasExtractableNestedTransaction(traceId: string): boolean {
-        const buffer = this.buffers.get(traceId);
-        if (!buffer || buffer.length === 0) {
-            return false;
-        }
-        const live = this.liveParents.get(traceId) ?? new Map<string, string | undefined>();
-        if (live.size === 0) {
-            return false;
-        }
-        const parentOf = new Map<string, string>();
-        for (const span of buffer) {
-            const parentId = span.parentSpanContext?.spanId;
-            if (parentId) {
-                parentOf.set(span.spanContext().spanId, parentId);
-            }
-        }
-        for (const [spanId, parentId] of live) {
-            if (parentId) {
-                parentOf.set(spanId, parentId);
-            }
-        }
-        const underRoot = (spanId: string, rootId: string): boolean => {
-            const seen = new Set<string>();
-            let cur: string | undefined = spanId;
-            while (cur && !seen.has(cur)) {
-                if (cur === rootId) {
-                    return true;
-                }
-                seen.add(cur);
-                cur = parentOf.get(cur);
-            }
-            return false;
-        };
-        const hasLiveInSubtree = (rootId: string): boolean => {
-            if (live.has(rootId)) {
-                return true;
-            }
-            for (const liveId of live.keys()) {
-                if (underRoot(liveId, rootId)) {
-                    return true;
-                }
-            }
-            return false;
-        };
-        for (const span of buffer) {
-            if (span.attributes[CoralogixAttributes.TRANSACTION_ROOT] !== true) {
-                continue;
-            }
-            const rootId = span.spanContext().spanId;
-            if (!hasLiveInSubtree(rootId)) {
-                return true;
-            }
-        }
-        return false;
     }
 
     private finalizeNestedCompleted(traceId: string): void {
@@ -400,7 +386,7 @@ export class TransactionSpanProcessor implements SpanProcessor {
             // Whole trace idle — let the normal idle path own finalization.
             return;
         }
-        const batches = this.extractCompletedLocalTransactions(traceId);
+        const batches = this.extractCompleted(traceId);
         for (const batch of batches) {
             this.acceptCompleted(batch);
         }
@@ -431,127 +417,34 @@ export class TransactionSpanProcessor implements SpanProcessor {
         if (live && live.size > 0) {
             return;
         }
-        const batches = this.extractCompletedLocalTransactions(traceId, true);
+        const batches = this.extractCompleted(traceId, true);
         for (const batch of batches) {
             this.acceptCompleted(batch);
         }
         this.liveParents.delete(traceId);
-        this.clearTransactionsForTrace(traceId);
+        this.membership.clearTrace(traceId);
     }
 
-    private extractCompletedLocalTransactions(
-        traceId: string,
-        flushLeftoverWhenIdle = false,
-    ): ReadableSpan[][] {
+    private extractCompleted(traceId: string, flushLeftoverWhenIdle = false): ReadableSpan[][] {
         const buffer = this.buffers.get(traceId);
         if (!buffer || buffer.length === 0) {
             return [];
         }
-
         const live = this.liveParents.get(traceId) ?? new Map<string, string | undefined>();
-        const parentOf = new Map<string, string>();
-        for (const span of buffer) {
-            const parentId = span.parentSpanContext?.spanId;
-            if (parentId) {
-                parentOf.set(span.spanContext().spanId, parentId);
-            }
+        const {batches, remaining} = extractCompletedLocalTransactions(
+            buffer,
+            live,
+            flushLeftoverWhenIdle,
+        );
+        if (remaining.length > 0) {
+            this.buffers.set(traceId, remaining);
+        } else {
+            this.buffers.delete(traceId);
         }
-        for (const [spanId, parentId] of live) {
-            if (parentId) {
-                parentOf.set(spanId, parentId);
-            }
-        }
-
-        const underRoot = (spanId: string, rootId: string): boolean => {
-            const seen = new Set<string>();
-            let cur: string | undefined = spanId;
-            while (cur && !seen.has(cur)) {
-                if (cur === rootId) {
-                    return true;
-                }
-                seen.add(cur);
-                cur = parentOf.get(cur);
-            }
-            return false;
-        };
-
-        const hasLiveInSubtree = (rootId: string): boolean => {
-            if (live.has(rootId)) {
-                return true;
-            }
-            for (const liveId of live.keys()) {
-                if (underRoot(liveId, rootId)) {
-                    return true;
-                }
-            }
-            return false;
-        };
-
-        const depthOf = (spanId: string): number => {
-            let depth = 0;
-            let cur: string | undefined = spanId;
-            const seen = new Set<string>();
-            while (cur && !seen.has(cur)) {
-                seen.add(cur);
-                const parent = parentOf.get(cur);
-                if (!parent) {
-                    break;
-                }
-                depth++;
-                cur = parent;
-            }
-            return depth;
-        };
-
-        const roots = buffer
-            .filter((span) => span.attributes[CoralogixAttributes.TRANSACTION_ROOT] === true)
-            .sort((a, b) => depthOf(b.spanContext().spanId) - depthOf(a.spanContext().spanId));
-
-        const batches: ReadableSpan[][] = [];
-        const extracted = new Set<string>();
-
-        for (const root of roots) {
-            const rootId = root.spanContext().spanId;
-            if (extracted.has(rootId) || hasLiveInSubtree(rootId)) {
-                continue;
-            }
-            const subtree = buffer.filter((span) => {
-                const spanId = span.spanContext().spanId;
-                if (extracted.has(spanId)) {
-                    return false;
-                }
-                return underRoot(spanId, rootId);
-            });
-            if (subtree.length === 0) {
-                continue;
-            }
-            for (const span of subtree) {
-                extracted.add(span.spanContext().spanId);
-            }
-            batches.push(subtree);
-        }
-
-        if (extracted.size > 0) {
-            const remaining = buffer.filter((span) => !extracted.has(span.spanContext().spanId));
-            if (remaining.length > 0) {
-                this.buffers.set(traceId, remaining);
-            } else {
-                this.buffers.delete(traceId);
-            }
-        }
-
-        if (flushLeftoverWhenIdle && live.size === 0) {
-            const leftover = this.buffers.get(traceId);
-            if (leftover && leftover.length > 0) {
-                this.buffers.delete(traceId);
-                batches.push(leftover);
-            }
-        }
-
         return batches;
     }
 
-    private async waitForIdle(timeoutMs = 30_000): Promise<void> {
+    private async waitForIdle(timeoutMs = DEFAULT_SHUTDOWN_IDLE_WAIT_MILLIS): Promise<void> {
         const deadline = Date.now() + timeoutMs;
         while (this.totalLive() > 0 && Date.now() < deadline) {
             await new Promise((resolve) => setTimeout(resolve, 10));
@@ -566,80 +459,13 @@ export class TransactionSpanProcessor implements SpanProcessor {
         return n;
     }
 
-    private applyTransactionAttributes(span: Span, parentContext: Context): void {
-        const parentSpanContext = trace.getSpanContext(parentContext);
-        const parentTransaction = this.resolveParentTransaction(span.spanContext().traceId, parentContext, parentSpanContext);
-
-        const startsNewTransaction = parentTransaction === undefined
-            || parentSpanContext?.isRemote === true
-            || span.kind === SpanKind.SERVER
-            || span.kind === SpanKind.CONSUMER;
-
-        const existingName = asString(span.attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER]);
-        let transaction: string;
-        if (startsNewTransaction) {
-            if (existingName !== undefined && existingName !== parentTransaction) {
-                transaction = existingName;
-            } else {
-                transaction = span.name;
-            }
-        } else {
-            transaction = parentTransaction as string;
-        }
-        const attributes: Attributes = {
-            [CoralogixAttributes.TRANSACTION_IDENTIFIER]: transaction,
-        };
-        if (startsNewTransaction) {
-            attributes[CoralogixAttributes.TRANSACTION_ROOT] = true;
-        }
-        span.setAttributes(attributes);
-        this.transactionsBySpan.set(spanKey(span.spanContext().traceId, span.spanContext().spanId), transaction);
-    }
-
-    startNewTransaction(span: Span, name: string): void {
-        span.setAttributes({
-            [CoralogixAttributes.TRANSACTION_IDENTIFIER]: name,
-            [CoralogixAttributes.TRANSACTION_ROOT]: true,
-        });
-        const {traceId, spanId} = span.spanContext();
-        if (isSpanContextValid(span.spanContext())) {
-            this.transactionsBySpan.set(spanKey(traceId, spanId), name);
-        }
-    }
-
-    private resolveParentTransaction(
-        traceId: string,
-        parentContext: Context,
-        parentSpanContext: ReturnType<typeof trace.getSpanContext>,
-    ): string | undefined {
-        const fromAttrs = asString(
-            getAttributesOf(trace.getSpan(parentContext))?.[CoralogixAttributes.TRANSACTION_IDENTIFIER],
-        );
-        if (fromAttrs !== undefined) {
-            return fromAttrs;
-        }
-        if (parentSpanContext && isSpanContextValid(parentSpanContext) && !parentSpanContext.isRemote) {
-            const fromTraceState = parentSpanContext.traceState?.get(CoralogixTraceState.TRANSACTION_IDENTIFIER);
-            if (fromTraceState) {
-                return fromTraceState;
-            }
-            return this.transactionsBySpan.get(spanKey(traceId, parentSpanContext.spanId));
-        }
-        if (parentSpanContext?.isRemote === true) {
-            return parentSpanContext.traceState?.get(CoralogixTraceState.TRANSACTION_IDENTIFIER);
-        }
-        return undefined;
-    }
-
-    private clearTransactionsForTrace(traceId: string): void {
-        const prefix = `${traceId}:`;
-        for (const key of this.transactionsBySpan.keys()) {
-            if (key.startsWith(prefix)) {
-                this.transactionsBySpan.delete(key);
-            }
-        }
-    }
-
+    /**
+     * Export finalize for one completed local transaction batch:
+     * 1) stamp final transaction names
+     * 2) stamp self duration + metrics
+     * 3) trim nodes
+     * 4) harvest or export
+     */
     private acceptCompleted(spans: ReadableSpan[]): void {
         const intervalSnapshot = new Map<string, Array<{startNs: bigint; endNs: bigint}>>();
         for (const span of spans) {
@@ -651,7 +477,8 @@ export class TransactionSpanProcessor implements SpanProcessor {
         }
 
         try {
-            this.stampSelfTimeAndMetrics(spans, intervalSnapshot);
+            this.membership.finalizeBatchNames(spans);
+            stampSelfDurationAndMetrics(spans, intervalSnapshot, this.selfDurationHistogram);
 
             const rootSpanIds = spans
                 .filter((span) => span.attributes[CoralogixAttributes.TRANSACTION_ROOT] === true)
@@ -682,56 +509,6 @@ export class TransactionSpanProcessor implements SpanProcessor {
             for (const span of spans) {
                 this.childIntervals.delete(span.spanContext().spanId);
             }
-        }
-    }
-
-    private stampSelfTimeAndMetrics(
-        spans: ReadableSpan[],
-        childIntervalSnapshot: Map<string, Array<{startNs: bigint; endNs: bigint}>>,
-    ): void {
-        const rows: SpanTimingRow[] = [];
-        for (const span of spans) {
-            const spanId = span.spanContext().spanId;
-            const startNs = hrTimeToBigIntNanos(span.startTime);
-            const endNs = hrTimeToBigIntNanos(span.endTime);
-            rows.push({
-                spanId,
-                parentSpanId: span.parentSpanContext?.spanId,
-                startNs,
-                endNs,
-            });
-            const priorIntervals = childIntervalSnapshot.get(spanId) ?? [];
-            for (let index = 0; index < priorIntervals.length; index++) {
-                const {startNs: priorStart, endNs: priorEnd} = priorIntervals[index]!;
-                const duplicateInBatch = spans.some((other) => {
-                    const otherParentId = other.parentSpanContext?.spanId;
-                    if (otherParentId !== spanId) {
-                        return false;
-                    }
-                    return hrTimeToBigIntNanos(other.startTime) === priorStart
-                        && hrTimeToBigIntNanos(other.endTime) === priorEnd;
-                });
-                if (duplicateInBatch) {
-                    continue;
-                }
-                rows.push({
-                    spanId: `${spanId}:prior:${index}`,
-                    parentSpanId: spanId,
-                    startNs: priorStart,
-                    endNs: priorEnd,
-                });
-            }
-        }
-        const selfTimes = selfTimeNsBySpanId(rows);
-
-        for (const span of spans) {
-            const selfTimeNs = selfTimes.get(span.spanContext().spanId);
-            if (selfTimeNs === undefined) {
-                continue;
-            }
-            const selfTimeSec = Number(selfTimeNs) / 1_000_000_000;
-            span.attributes[CoralogixAttributes.SELF_TIME] = selfTimeSec;
-            this.recordSelfTimeMetric(span, selfTimeSec);
         }
     }
 
@@ -794,21 +571,6 @@ export class TransactionSpanProcessor implements SpanProcessor {
             await Promise.all([...this.pendingExports]);
         }
     }
-
-    private recordSelfTimeMetric(span: ReadableSpan, selfTimeSec: number): void {
-        const attributes = span.attributes;
-        const metricAttributes: Record<string, string | boolean> = {
-            [METRIC_ATTR_SPAN_NAME]: span.name,
-        };
-        const transaction = attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER];
-        if (transaction !== undefined) {
-            metricAttributes[CoralogixAttributes.TRANSACTION_IDENTIFIER] = String(transaction);
-        }
-        if (attributes[CoralogixAttributes.TRANSACTION_ROOT] === true) {
-            metricAttributes[CoralogixAttributes.TRANSACTION_ROOT] = true;
-        }
-        this.selfTimeHistogram.record(selfTimeSec, metricAttributes);
-    }
 }
 
 const NANOS_PER_SECOND = BigInt(1_000_000_000);
@@ -817,55 +579,5 @@ function hrTimeToBigIntNanos(hrTime: readonly [number, number]): bigint {
     return BigInt(hrTime[0]) * NANOS_PER_SECOND + BigInt(hrTime[1]);
 }
 
-function getAttributesOf(span: unknown): Attributes | undefined {
-    if (!span || typeof span !== "object") {
-        return undefined;
-    }
-    return (span as { attributes?: Attributes }).attributes;
-}
-
-function asString(value: AttributeValue | undefined): string | undefined {
-    return typeof value === "string" ? value : undefined;
-}
-
-function spanKey(traceId: string, spanId: string): string {
-    return `${traceId}:${spanId}`;
-}
-
-function safeEndedSpans(
-    spans: ReadableSpan[],
-    liveParents: Map<string, string | undefined> | undefined,
-): ReadableSpan[] {
-    if (!liveParents || liveParents.size === 0) {
-        return spans;
-    }
-
-    const parentOf = new Map<string, string>();
-    for (const span of spans) {
-        const parentId = span.parentSpanContext?.spanId;
-        if (parentId) {
-            parentOf.set(span.spanContext().spanId, parentId);
-        }
-    }
-    for (const [spanId, parentId] of liveParents) {
-        if (parentId) {
-            parentOf.set(spanId, parentId);
-        }
-    }
-
-    const blocked = new Set<string>();
-    for (const liveId of liveParents.keys()) {
-        let cur = parentOf.get(liveId);
-        while (cur) {
-            if (blocked.has(cur)) {
-                break;
-            }
-            blocked.add(cur);
-            cur = parentOf.get(cur);
-        }
-    }
-    return spans.filter((span) => !blocked.has(span.spanContext().spanId));
-}
-
 /** Exported for unit tests. */
-export {safeEndedSpans as _safeEndedSpansForTests};
+export {safeEndedSpans as _safeEndedSpansForTests} from "./safe-ended";

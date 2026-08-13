@@ -67,7 +67,7 @@ function buildProvider(options: {maxRegularTraces?: number} = {}) {
 }
 
 export default describe('TransactionSpanProcessor', () => {
-    it('stamps self_time on completed spans and tags the transaction attributes itself', async () => {
+    it('stamps self_duration on completed spans and tags the transaction attributes itself', async () => {
         const {provider, tracer, exporter, meterProvider} = buildProvider();
         let context: Context = ROOT_CONTEXT;
 
@@ -96,18 +96,18 @@ export default describe('TransactionSpanProcessor', () => {
         assert.ok(!(CoralogixAttributes.TRANSACTION_ROOT in childSpan!.attributes),
             'child span must not have a transaction root attribute');
 
-        assert.ok(CoralogixAttributes.SELF_TIME in rootSpan!.attributes,
-            'root span must have a self_time attribute');
-        assert.ok(CoralogixAttributes.SELF_TIME in childSpan!.attributes,
-            'child span must have a self_time attribute');
-        assert.ok((childSpan!.attributes[CoralogixAttributes.SELF_TIME] as number) >= 0,
-            'child self-time must not be negative');
+        assert.ok(CoralogixAttributes.SELF_DURATION in rootSpan!.attributes,
+            'root span must have a self_duration attribute');
+        assert.ok(CoralogixAttributes.SELF_DURATION in childSpan!.attributes,
+            'child span must have a self_duration attribute');
+        assert.ok((childSpan!.attributes[CoralogixAttributes.SELF_DURATION] as number) >= 0,
+            'child self-duration must not be negative');
 
         await provider.shutdown();
         await meterProvider.shutdown();
     });
 
-    it('computes exact self-time for a parent fully covered by one child (parent 0-100, child 20-80 -> 40/60)', async () => {
+    it('computes exact self-duration for a parent fully covered by one child (parent 0-100, child 20-80 -> 40/60)', async () => {
         const {provider, tracer, exporter, meterProvider} = buildProvider();
         let context: Context = ROOT_CONTEXT;
 
@@ -125,8 +125,8 @@ export default describe('TransactionSpanProcessor', () => {
         const rootSpan = spans.find((s) => s.name === 'parent');
         const childSpan = spans.find((s) => s.name === 'child');
 
-        assert.strictEqual(rootSpan!.attributes[CoralogixAttributes.SELF_TIME], 40 / 1e9);
-        assert.strictEqual(childSpan!.attributes[CoralogixAttributes.SELF_TIME], 60 / 1e9);
+        assert.strictEqual(rootSpan!.attributes[CoralogixAttributes.SELF_DURATION], 40 / 1e9);
+        assert.strictEqual(childSpan!.attributes[CoralogixAttributes.SELF_DURATION], 60 / 1e9);
 
         await provider.shutdown();
         await meterProvider.shutdown();
@@ -157,7 +157,7 @@ export default describe('TransactionSpanProcessor', () => {
         await meterProvider.shutdown();
     });
 
-    it('always records the cgx.transaction.self_time histogram', async () => {
+    it('always records the cgx.transaction.self_duration histogram', async () => {
         const {provider, tracer, reader, meterProvider} = buildProvider();
         let context: Context = ROOT_CONTEXT;
 
@@ -172,7 +172,7 @@ export default describe('TransactionSpanProcessor', () => {
 
         const {resourceMetrics} = await reader.collect();
         const metricNames = resourceMetrics.scopeMetrics.flatMap((sm) => sm.metrics.map((m) => m.descriptor.name));
-        assert.ok(metricNames.includes(CoralogixAttributes.SELF_TIME), `expected ${CoralogixAttributes.SELF_TIME} metric to have been recorded`);
+        assert.ok(metricNames.includes(CoralogixAttributes.SELF_DURATION), `expected ${CoralogixAttributes.SELF_DURATION} metric to have been recorded`);
 
         await provider.shutdown();
         await meterProvider.shutdown();
@@ -244,7 +244,7 @@ export default describe('TransactionSpanProcessor', () => {
         await meterProvider.shutdown();
     });
 
-    it('integration: remote parent starts a new local transaction, annotated with self-time', async () => {
+    it('integration: remote parent starts a new local transaction, annotated with self-duration', async () => {
         const {provider, tracer, exporter, meterProvider} = buildProvider();
         let context: Context = ROOT_CONTEXT;
 
@@ -281,12 +281,12 @@ export default describe('TransactionSpanProcessor', () => {
         assert.ok(!(CoralogixAttributes.DISTRIBUTED_TRANSACTION_IDENTIFIER in downstreamRootSpan.attributes));
 
         assert.strictEqual(downstreamChildSpan.attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER], 'POST /charge');
-        assert.ok(CoralogixAttributes.SELF_TIME in upstreamSpan.attributes);
-        assert.ok(CoralogixAttributes.SELF_TIME in downstreamRootSpan.attributes);
-        assert.ok(CoralogixAttributes.SELF_TIME in downstreamChildSpan.attributes);
-        assert.ok((upstreamSpan.attributes[CoralogixAttributes.SELF_TIME] as number) >= 0);
-        assert.ok((downstreamRootSpan.attributes[CoralogixAttributes.SELF_TIME] as number) >= 0);
-        assert.ok((downstreamChildSpan.attributes[CoralogixAttributes.SELF_TIME] as number) >= 0);
+        assert.ok(CoralogixAttributes.SELF_DURATION in upstreamSpan.attributes);
+        assert.ok(CoralogixAttributes.SELF_DURATION in downstreamRootSpan.attributes);
+        assert.ok(CoralogixAttributes.SELF_DURATION in downstreamChildSpan.attributes);
+        assert.ok((upstreamSpan.attributes[CoralogixAttributes.SELF_DURATION] as number) >= 0);
+        assert.ok((downstreamRootSpan.attributes[CoralogixAttributes.SELF_DURATION] as number) >= 0);
+        assert.ok((downstreamChildSpan.attributes[CoralogixAttributes.SELF_DURATION] as number) >= 0);
 
         await provider.shutdown();
         await meterProvider.shutdown();
@@ -335,7 +335,7 @@ export default describe('TransactionSpanProcessor', () => {
             sm.metrics.map((m) => m.descriptor.name),
         );
         assert.ok(
-            metricNames.includes(CoralogixAttributes.SELF_TIME),
+            metricNames.includes(CoralogixAttributes.SELF_DURATION),
             'metrics are recorded even for traces that lose the harvest',
         );
 
@@ -534,7 +534,7 @@ export default describe('TransactionSpanProcessor', () => {
         spans = exporter.getFinishedSpans();
         assert.strictEqual(spans.length, 3, 'outer exports after it ends');
         const outerSpan = spans.find((s) => s.name === 'worker.run')!;
-        assert.ok(CoralogixAttributes.SELF_TIME in outerSpan.attributes);
+        assert.ok(CoralogixAttributes.SELF_DURATION in outerSpan.attributes);
 
         await provider.shutdown();
         await meterProvider.shutdown();
@@ -573,9 +573,9 @@ export default describe('TransactionSpanProcessor', () => {
         assert.ok(spans.some((s) => s.name === 'parent'));
         assert.ok(spans.some((s) => s.name === 'async-child'));
         const parentSpan = spans.find((s) => s.name === 'parent')!;
-        // parent [0,40], child [50,80] does not overlap parent → self-time = full 40ns... 
+        // parent [0,40], child [50,80] does not overlap parent → self-duration = full 40ns... 
         // wait times are [sec, ns] - [0,40] means 40 nanoseconds
-        assert.ok(CoralogixAttributes.SELF_TIME in parentSpan.attributes);
+        assert.ok(CoralogixAttributes.SELF_DURATION in parentSpan.attributes);
 
         await provider.shutdown();
         await meterProvider.shutdown();
@@ -848,6 +848,42 @@ export default describe('TransactionSpanProcessor', () => {
             'holdback after exporterShutdown must not export',
         );
 
+        await meterProvider.shutdown();
+    });
+
+    it('stamps cgx.transaction from final root name after updateName (Express-style)', async () => {
+        const {provider, tracer, exporter, meterProvider} = buildProvider();
+        let context: Context = ROOT_CONTEXT;
+
+        // Express HTTP instrumentation often starts the span as "GET", then
+        // middleware renames it to "GET /myroute" before end.
+        const root = tracer.startSpan('GET', {kind: SpanKind.SERVER}, context);
+        root.updateName('GET /myroute');
+        context = opentelemetry.trace.setSpan(context, root);
+        const child = tracer.startSpan('db', {}, context);
+        child.end();
+        root.end();
+
+        await provider.forceFlush();
+        const spans = exporter.getFinishedSpans();
+        const rootSpan = spans.find((s) => s.name === 'GET /myroute');
+        const childSpan = spans.find((s) => s.name === 'db');
+        assert.ok(rootSpan, 'renamed root must be exported');
+        assert.ok(childSpan, 'child must be exported');
+
+        assert.strictEqual(
+            rootSpan!.attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER],
+            'GET /myroute',
+            'transaction name must use final root span name, not the start name',
+        );
+        assert.strictEqual(
+            childSpan!.attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER],
+            'GET /myroute',
+            'children must receive the finalized root transaction name',
+        );
+        assert.strictEqual(rootSpan!.attributes[CoralogixAttributes.TRANSACTION_ROOT], true);
+
+        await provider.shutdown();
         await meterProvider.shutdown();
     });
 });

@@ -1,10 +1,14 @@
-// Exclusive (self) wall-clock time for spans.
-//
-// Self-time is a span's own duration minus the time covered by its direct children (clamped to
-// the parent's own interval, and merged so overlapping/concurrent children aren't double
-// counted). Nanosecond math is done in `bigint` because absolute epoch nanoseconds overflow
-// `Number.MAX_SAFE_INTEGER`; only the (small) resulting durations are ever converted back to
-// `number`.
+/**
+ * Exclusive (self) wall-clock duration for spans.
+ *
+ * Self duration is a span's own duration minus time covered by its direct
+ * children. Child intervals are clamped to the parent's `[start, end)` and
+ * merged so overlapping / concurrent children are not double-counted.
+ *
+ * Nanosecond math uses `bigint` because absolute epoch nanoseconds overflow
+ * `Number.MAX_SAFE_INTEGER`; only the (small) resulting durations are converted
+ * back to `number` at export.
+ */
 
 export interface SpanTimingRow {
     spanId: string;
@@ -20,7 +24,7 @@ interface SpanNode extends SpanTimingRow {
     children: SpanNode[];
 }
 
-export function selfTimeNsBySpanId(rows: SpanTimingRow[]): Map<string, bigint> {
+export function selfDurationNsBySpanId(rows: SpanTimingRow[]): Map<string, bigint> {
     const byId = new Map<string, SpanNode>();
     for (const row of rows) {
         if (!byId.has(row.spanId)) {
@@ -35,14 +39,17 @@ export function selfTimeNsBySpanId(rows: SpanTimingRow[]): Map<string, bigint> {
     }
     const result = new Map<string, bigint>();
     for (const [spanId, node] of byId) {
-        result.set(spanId, selfTime(node));
+        result.set(spanId, exclusiveSelfDurationNs(node));
     }
     return result;
 }
 
+/** @deprecated Use {@link selfDurationNsBySpanId}. */
+export const selfTimeNsBySpanId = selfDurationNsBySpanId;
+
 const ZERO = BigInt(0);
 
-function selfTime(node: SpanNode): bigint {
+function exclusiveSelfDurationNs(node: SpanNode): bigint {
     const duration = durationNs(node.startNs, node.endNs);
     if (duration === ZERO || node.children.length === 0) {
         return duration;
@@ -59,7 +66,25 @@ function durationNs(startNs: bigint, endNs: bigint): bigint {
     return endNs > startNs ? endNs - startNs : ZERO;
 }
 
-function coveredDurationNs(parentStart: bigint, parentEnd: bigint, intervals: [bigint, bigint][]): bigint {
+/**
+ * Total duration within `[parentStart, parentEnd)` covered by `intervals`,
+ * after clamp + overlap merge.
+ */
+export function coveredDurationNs(
+    parentStart: bigint,
+    parentEnd: bigint,
+    intervals: [bigint, bigint][],
+): bigint {
+    const clamped = clampIntervalsToParent(parentStart, parentEnd, intervals);
+    return mergedCoveredDurationNs(clamped);
+}
+
+/** Clamp each interval to the parent window; drop empty results. */
+export function clampIntervalsToParent(
+    parentStart: bigint,
+    parentEnd: bigint,
+    intervals: [bigint, bigint][],
+): [bigint, bigint][] {
     const clamped: [bigint, bigint][] = [];
     for (const [start, end] of intervals) {
         const clippedStart = start > parentStart ? start : parentStart;
@@ -68,17 +93,30 @@ function coveredDurationNs(parentStart: bigint, parentEnd: bigint, intervals: [b
             clamped.push([clippedStart, clippedEnd]);
         }
     }
-    if (clamped.length === 0) {
+    return clamped;
+}
+
+/**
+ * Sort intervals once by start, then merge overlaps and sum covered length.
+ * Input must already be clamped / non-empty intervals.
+ */
+export function mergedCoveredDurationNs(sortedOrUnsorted: [bigint, bigint][]): bigint {
+    if (sortedOrUnsorted.length === 0) {
         return ZERO;
     }
-    clamped.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+    // Sort once, then merge — do not sort again inside the merge loop.
+    const sortedClamped = sortedOrUnsorted.slice().sort((a, b) => (
+        a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0
+    ));
 
     let covered = ZERO;
-    let [mergedStart, mergedEnd] = clamped[0]!;
-    for (let i = 1; i < clamped.length; i++) {
-        const [start, end] = clamped[i]!;
+    let [mergedStart, mergedEnd] = sortedClamped[0]!;
+    for (let i = 1; i < sortedClamped.length; i++) {
+        const [start, end] = sortedClamped[i]!;
         if (start <= mergedEnd) {
-            if (end > mergedEnd) mergedEnd = end;
+            if (end > mergedEnd) {
+                mergedEnd = end;
+            }
             continue;
         }
         covered += mergedEnd - mergedStart;
