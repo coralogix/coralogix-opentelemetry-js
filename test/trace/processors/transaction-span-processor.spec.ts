@@ -11,7 +11,7 @@ import {
 } from "@opentelemetry/sdk-trace-base";
 import {ExportResultCode} from "@opentelemetry/core";
 import {MeterProvider, MetricReader} from "@opentelemetry/sdk-metrics";
-import {CoralogixAttributes, CoralogixTraceState} from "../../../src/trace/common";
+import {CoralogixAttributes, CoralogixTraceState, METRIC_SELF_DURATION} from "../../../src/trace/common";
 import {TransactionSpanProcessor} from "../../../src/trace/processors";
 import {createTraceState} from "@opentelemetry/api";
 
@@ -172,7 +172,7 @@ export default describe('TransactionSpanProcessor', () => {
 
         const {resourceMetrics} = await reader.collect();
         const metricNames = resourceMetrics.scopeMetrics.flatMap((sm) => sm.metrics.map((m) => m.descriptor.name));
-        assert.ok(metricNames.includes(CoralogixAttributes.SELF_DURATION), `expected ${CoralogixAttributes.SELF_DURATION} metric to have been recorded`);
+        assert.ok(metricNames.includes(METRIC_SELF_DURATION), `expected ${METRIC_SELF_DURATION} metric to have been recorded`);
 
         await provider.shutdown();
         await meterProvider.shutdown();
@@ -335,7 +335,7 @@ export default describe('TransactionSpanProcessor', () => {
             sm.metrics.map((m) => m.descriptor.name),
         );
         assert.ok(
-            metricNames.includes(CoralogixAttributes.SELF_DURATION),
+            metricNames.includes(METRIC_SELF_DURATION),
             'metrics are recorded even for traces that lose the harvest',
         );
 

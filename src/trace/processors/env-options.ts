@@ -63,7 +63,7 @@ export function parseEnvInt(raw: string | undefined, fallback: number): number {
         return fallback;
     }
     const n = Number(raw);
-    if (!Number.isFinite(n) || !Number.isInteger(n)) {
+    if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0) {
         return fallback;
     }
     return n;

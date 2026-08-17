@@ -22,7 +22,8 @@ export default describe("resolveProcessorOptions / parseEnvInt", () => {
         assert.strictEqual(parseEnvInt("NaN", 7), 7);
         assert.strictEqual(parseEnvInt("42", 7), 42);
         assert.strictEqual(parseEnvInt("0", 7), 0);
-        assert.strictEqual(parseEnvInt("-1", 7), -1);
+        assert.strictEqual(parseEnvInt("-1", 7), 7);
+        assert.strictEqual(parseEnvInt("-42", 7), 7);
     });
 
     it("uses defaults when constructor and env are empty", () => {

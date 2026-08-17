@@ -6,7 +6,6 @@ export {
     DEFAULT_MAX_TXN_TRACE_NODES,
 } from './transaction-span-processor';
 export type {TransactionSpanProcessorOptions} from './transaction-span-processor';
-export {startNewTransaction} from './start-new-transaction';
 export {
     DEFAULT_SHUTDOWN_IDLE_WAIT_MILLIS,
     ENV_COMPLETION_HOLDBACK_MILLIS,

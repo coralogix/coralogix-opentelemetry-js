@@ -16,6 +16,25 @@ export function stampSelfDurationAndMetrics(
     childIntervalSnapshot: Map<string, Array<{startNs: bigint; endNs: bigint}>>,
     histogram: Histogram,
 ): void {
+    // parentSpanId -> Set of "startNs:endNs" for direct children already in this batch.
+    // Avoids a nested spans.some scan when skipping duplicate prior intervals.
+    const directChildIntervalsInBatch = new Map<string, Set<string>>();
+    for (const span of spans) {
+        const parentId = span.parentSpanContext?.spanId;
+        if (!parentId) {
+            continue;
+        }
+        let keys = directChildIntervalsInBatch.get(parentId);
+        if (!keys) {
+            keys = new Set<string>();
+            directChildIntervalsInBatch.set(parentId, keys);
+        }
+        keys.add(intervalKey(
+            hrTimeToBigIntNanos(span.startTime),
+            hrTimeToBigIntNanos(span.endTime),
+        ));
+    }
+
     const rows: SpanTimingRow[] = [];
     for (const span of spans) {
         const spanId = span.spanContext().spanId;
@@ -28,17 +47,10 @@ export function stampSelfDurationAndMetrics(
             endNs,
         });
         const priorIntervals = childIntervalSnapshot.get(spanId) ?? [];
+        const batchChildKeys = directChildIntervalsInBatch.get(spanId);
         for (let index = 0; index < priorIntervals.length; index++) {
             const {startNs: priorStart, endNs: priorEnd} = priorIntervals[index]!;
-            const duplicateInBatch = spans.some((other) => {
-                const otherParentId = other.parentSpanContext?.spanId;
-                if (otherParentId !== spanId) {
-                    return false;
-                }
-                return hrTimeToBigIntNanos(other.startTime) === priorStart
-                    && hrTimeToBigIntNanos(other.endTime) === priorEnd;
-            });
-            if (duplicateInBatch) {
+            if (batchChildKeys?.has(intervalKey(priorStart, priorEnd))) {
                 continue;
             }
             rows.push({
@@ -60,6 +72,10 @@ export function stampSelfDurationAndMetrics(
         span.attributes[CoralogixAttributes.SELF_DURATION] = selfDurationSec;
         recordSelfDurationMetric(histogram, span, selfDurationSec);
     }
+}
+
+function intervalKey(startNs: bigint, endNs: bigint): string {
+    return `${startNs}:${endNs}`;
 }
 
 function recordSelfDurationMetric(

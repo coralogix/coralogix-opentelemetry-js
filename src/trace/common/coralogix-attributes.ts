@@ -4,3 +4,4 @@ export const CoralogixAttributes = {
     TRANSACTION_ROOT: 'cgx.transaction.root',
     SELF_DURATION: 'cgx.transaction.self_duration',
 };
+export const METRIC_SELF_DURATION = 'cgx.transaction.self_duration';

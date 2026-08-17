@@ -8,7 +8,7 @@ import {
     trace,
 } from "@opentelemetry/api";
 import {ReadableSpan, Span, SpanExporter, SpanProcessor} from "@opentelemetry/sdk-trace-base";
-import {CoralogixAttributes} from "../common";
+import {CoralogixAttributes, METRIC_SELF_DURATION} from "../common";
 import {DEFAULT_SHUTDOWN_IDLE_WAIT_MILLIS} from "./defaults";
 import {resolveProcessorOptions} from "./env-options";
 import {
@@ -116,7 +116,7 @@ export class TransactionSpanProcessor implements SpanProcessor {
         this.shutdownIdleWaitMillis = options.shutdownIdleWaitMillis ?? DEFAULT_SHUTDOWN_IDLE_WAIT_MILLIS;
         this.harvest = new RegularTraceHeap(this.maxRegularTraces);
         const meter = (options.meterProvider ?? metrics.getMeterProvider()).getMeter(INSTRUMENTATION_SCOPE_NAME);
-        this.selfDurationHistogram = meter.createHistogram(CoralogixAttributes.SELF_DURATION, {
+        this.selfDurationHistogram = meter.createHistogram(METRIC_SELF_DURATION, {
             unit: "s",
             description: "Exclusive (self) wall time per span within a Coralogix transaction",
         });
@@ -578,6 +578,3 @@ const NANOS_PER_SECOND = BigInt(1_000_000_000);
 function hrTimeToBigIntNanos(hrTime: readonly [number, number]): bigint {
     return BigInt(hrTime[0]) * NANOS_PER_SECOND + BigInt(hrTime[1]);
 }
-
-/** Exported for unit tests. */
-export {safeEndedSpans as _safeEndedSpansForTests} from "./safe-ended";

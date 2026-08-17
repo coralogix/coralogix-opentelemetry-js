@@ -44,9 +44,6 @@ export function selfDurationNsBySpanId(rows: SpanTimingRow[]): Map<string, bigin
     return result;
 }
 
-/** @deprecated Use {@link selfDurationNsBySpanId}. */
-export const selfTimeNsBySpanId = selfDurationNsBySpanId;
-
 const ZERO = BigInt(0);
 
 function exclusiveSelfDurationNs(node: SpanNode): bigint {
