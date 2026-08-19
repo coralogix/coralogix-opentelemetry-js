@@ -3,7 +3,7 @@
 [![npm version](https://img.shields.io/npm/v/@coralogix/opentelemetry.svg)](https://www.npmjs.com/package/@coralogix/opentelemetry)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
 
-Coralogix extensions for the [OpenTelemetry Node SDK](https://github.com/open-telemetry/opentelemetry-js). This package adds Coralogix-specific behavior on top of a standard OpenTelemetry tracing setup — most notably a sampler that defines and propagates Coralogix [transactions](https://coralogix.com/docs/user-guides/apm/features/transactions/) for APM.
+Coralogix extensions for the [OpenTelemetry Node SDK](https://github.com/open-telemetry/opentelemetry-js). This package adds Coralogix-specific behavior on top of a standard OpenTelemetry tracing setup — transaction tagging via a sampler and/or a `SpanProcessor`, including exclusive self duration on the processor path.
 
 ```bash
 npm install --save @coralogix/opentelemetry
@@ -65,6 +65,55 @@ When a span starts a transaction, the sampler adds the following attributes:
 | `cgx.transaction` | The transaction name (e.g. `GET /users/:id`). |
 | `cgx.transaction.distributed` | The distributed transaction name propagated across services. |
 | `cgx.transaction.root` | Whether this span is the root of the transaction. |
+
+## TransactionSpanProcessor
+
+`TransactionSpanProcessor` wraps a `SpanExporter` to tag Coralogix transactions, stamp exclusive self duration (`cgx.transaction.self_duration`, seconds) on completed local traces, and record the matching histogram (unit `s`). It works with any sampler.
+
+### How naming works
+
+Transaction **membership** (new vs inherit, and `cgx.transaction.root`) is decided on span start. The display name `cgx.transaction` is stamped only when a completed local trace is finalized for export, using `overrideName ?? rootSpan.name`. That matters for Express: the HTTP span often starts as `GET` and is later renamed to `GET /myroute` by middleware — the exported transaction name is the final root span name.
+
+### Harvest defaults (data loss)
+
+By default the processor keeps only the **slowest** completed local trace(s) for each harvest window:
+
+| Behavior | Default |
+| --- | --- |
+| Spans kept per local trace | `maxNodes: 256` (slowest first; transaction roots always kept) |
+| Traces kept until harvest | `maxRegularTraces: 1` |
+| Harvest period | `harvestPeriodMillis: 60_000` (60s) |
+
+**Data-loss implication:** with `maxRegularTraces: 1`, every completed local trace that is *not* the slowest in the current harvest window is **not** exported as a full waterfall. Losers are reduced to **root-only stubs** (APM presence) and dropped from the detailed export. Self-duration **metrics** are still recorded for every completed local trace, including losers.
+
+Set `maxRegularTraces: 0` to export every completed trimmed trace immediately (no harvest competition). Setting `harvestPeriodMillis: 0` also disables the heap and exports immediately.
+
+```js
+import { BasicTracerProvider, ConsoleSpanExporter } from "@opentelemetry/sdk-trace-base";
+import { TransactionSpanProcessor } from "@coralogix/opentelemetry";
+
+const tracerProvider = new BasicTracerProvider({
+    spanProcessors: [
+        new TransactionSpanProcessor(new ConsoleSpanExporter(), {
+            // Optional MeterProvider for the self-duration histogram; defaults to the global one.
+            // maxRegularTraces: 0, // export all completed traces (tests / debugging)
+        }),
+    ],
+});
+```
+
+### Options
+
+Constructor options win over environment variables. Invalid env values fall back to the default.
+
+| Option | Type | Default | Env var | Meaning |
+| --- | --- | --- | --- | --- |
+| `maxNodes` | `number` | `256` | `OTEL_CX_TRANSACTION_MAX_NODES` | Max spans kept per completed local trace (slowest first; roots always kept). |
+| `maxRegularTraces` | `number` | `1` | `OTEL_CX_TRANSACTION_MAX_REGULAR_TRACES` | Max full traces retained until harvest (slowest-N). `0` = export every completed trimmed trace immediately. Losers become root stubs. |
+| `harvestPeriodMillis` | `number` | `60000` | `OTEL_CX_TRANSACTION_HARVEST_PERIOD_MILLIS` | Harvest flush interval. `<= 0` exports every completed trace immediately (no heap). |
+| `completionHoldbackMillis` | `number` | `100` | `OTEL_CX_TRANSACTION_COMPLETION_HOLDBACK_MILLIS` | After the last live span ends, wait this long before finalize so late siblings can join. `0` = finalize immediately. |
+| `shutdownIdleWaitMillis` | `number` | `30000` | — | How long shutdown waits for in-flight spans. |
+| `meterProvider` | `MeterProvider` | global | — | MeterProvider for the self-duration histogram. |
 
 ## Transactions with Express
 
