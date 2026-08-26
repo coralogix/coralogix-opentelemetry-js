@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.0] - 2026-08-26
+
+### Added
+
+- `TransactionSpanProcessor`: tags Coralogix transactions (`cgx.transaction`,
+  `cgx.transaction.root`), stamps exclusive self duration
+  (`cgx.transaction.self_duration`, seconds), records the matching histogram, and by default
+  exports only the slowest completed local trace per harvest window (metrics are still
+  recorded for all traces). It works with any sampler and, unlike
+  `CoralogixTransactionSampler`, starts a new local transaction on nested `SERVER` /
+  `CONSUMER` spans, matching the Go and Java implementations. Prefer it over
+  `CoralogixTransactionSampler` for new integrations. (#36)
+
 ## [0.4.0] - 2026-07-08
 
 ### Changed
@@ -86,6 +99,7 @@
 
 - Initial release: `CoralogixTransactionSampler`. (#6)
 
+[0.5.0]: https://github.com/coralogix/coralogix-opentelemetry-js/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/coralogix/coralogix-opentelemetry-js/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/coralogix/coralogix-opentelemetry-js/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/coralogix/coralogix-opentelemetry-js/compare/v0.2.0...v0.2.1
