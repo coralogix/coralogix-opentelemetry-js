@@ -11,10 +11,6 @@ import {ReadableSpan, Span, SpanExporter, SpanProcessor} from "@opentelemetry/sd
 import {CoralogixAttributes, METRIC_SELF_DURATION} from "../common";
 import {DEFAULT_SHUTDOWN_IDLE_WAIT_MILLIS} from "./defaults";
 import {resolveProcessorOptions} from "./env-options";
-import {
-    RegularTraceHeap,
-    rootDurationNs,
-} from "./harvest";
 import {stampSelfDurationAndMetrics} from "./self-duration-stamp";
 import {selectSlowestSpans} from "./trace-heap";
 import {
@@ -35,20 +31,6 @@ export interface TransactionSpanProcessorOptions {
      */
     maxNodes?: number;
     /**
-     * Keep only the slowest completed local trace(s) until harvest.
-     * Default 1. Losers export as root-only stubs; self-duration metrics are
-     * still recorded for every completed local trace.
-     * Set to 0 to export every completed trimmed trace immediately.
-     * Env: `OTEL_CX_TRANSACTION_MAX_REGULAR_TRACES`.
-     */
-    maxRegularTraces?: number;
-    /**
-     * Harvest flush interval in milliseconds. Default 60_000.
-     * Values <= 0 export every completed trace immediately (no heap).
-     * Env: `OTEL_CX_TRANSACTION_HARVEST_PERIOD_MILLIS`.
-     */
-    harvestPeriodMillis?: number;
-    /**
      * After the last live span in a local trace ends, wait this long before
      * finalizing so fire-and-forget children that start on the same traceId
      * can still join. Default 100. Set to 0 to finalize immediately.
@@ -61,14 +43,12 @@ export interface TransactionSpanProcessorOptions {
 
 export {
     DEFAULT_COMPLETION_HOLDBACK_MILLIS,
-    DEFAULT_HARVEST_PERIOD_MILLIS,
-    DEFAULT_MAX_REGULAR_TRACES,
     DEFAULT_MAX_TXN_TRACE_NODES,
 } from "./defaults";
 
 /**
  * Tags Coralogix transactions, stamps exclusive self duration, trims nodes,
- * and optionally harvests the slowest completed local traces.
+ * and exports every completed trimmed local trace.
  *
  * Flow:
  * - **onStart**: track live spans; decide new vs inherit transaction; set
@@ -76,7 +56,7 @@ export {
  *   from the early span name (Express may rename later).
  * - **onEnd / holdback**: buffer until the local transaction subtree is idle.
  * - **acceptCompleted (export finalize)**: stamp final `cgx.transaction` from
- *   `overrideName ?? rootSpan.name`, then self duration + metrics, trim, harvest.
+ *   `overrideName ?? rootSpan.name`, then self duration + metrics, trim, export.
  */
 export class TransactionSpanProcessor implements SpanProcessor {
     private readonly exporter: SpanExporter;
@@ -86,12 +66,8 @@ export class TransactionSpanProcessor implements SpanProcessor {
     private readonly membership = new TransactionMembershipTracker();
     private readonly selfDurationHistogram: Histogram;
     private readonly maxNodes: number;
-    private readonly maxRegularTraces: number;
-    private readonly harvest: RegularTraceHeap;
-    private readonly harvestPeriodMillis: number;
     private readonly completionHoldbackMillis: number;
     private readonly shutdownIdleWaitMillis: number;
-    private harvestTimer: ReturnType<typeof setInterval> | undefined;
     /** traceId -> holdback timer after last live span ended */
     private readonly pendingCompletions = new Map<string, ReturnType<typeof setTimeout>>();
     /** traceId -> holdback timer while outer ancestors are still live but a nested txn completed */
@@ -110,26 +86,13 @@ export class TransactionSpanProcessor implements SpanProcessor {
         this.exporter = exporter;
         const resolved = resolveProcessorOptions(options);
         this.maxNodes = resolved.maxNodes;
-        this.maxRegularTraces = resolved.maxRegularTraces;
-        this.harvestPeriodMillis = resolved.harvestPeriodMillis;
         this.completionHoldbackMillis = resolved.completionHoldbackMillis;
         this.shutdownIdleWaitMillis = options.shutdownIdleWaitMillis ?? DEFAULT_SHUTDOWN_IDLE_WAIT_MILLIS;
-        this.harvest = new RegularTraceHeap(this.maxRegularTraces);
         const meter = (options.meterProvider ?? metrics.getMeterProvider()).getMeter(INSTRUMENTATION_SCOPE_NAME);
         this.selfDurationHistogram = meter.createHistogram(METRIC_SELF_DURATION, {
             unit: "s",
             description: "Exclusive (self) wall time per span within a Coralogix transaction",
         });
-        if (this.maxRegularTraces > 0 && this.harvestPeriodMillis > 0) {
-            this.harvestTimer = setInterval(() => {
-                void this.flushHarvest().catch((error) => {
-                    diag.warn("TransactionSpanProcessor: harvest flush failed", error);
-                });
-            }, this.harvestPeriodMillis);
-            if (typeof this.harvestTimer.unref === "function") {
-                this.harvestTimer.unref();
-            }
-        }
     }
 
     /**
@@ -231,7 +194,6 @@ export class TransactionSpanProcessor implements SpanProcessor {
             return;
         }
         this.flushPendingCompletions();
-        await this.flushHarvest();
         await this.awaitPendingExports();
         if (this.exporterShutdown || !this.exporter.forceFlush) {
             return;
@@ -254,10 +216,6 @@ export class TransactionSpanProcessor implements SpanProcessor {
 
     private async doShutdown(): Promise<void> {
         this.stopped = true;
-        if (this.harvestTimer !== undefined) {
-            clearInterval(this.harvestTimer);
-            this.harvestTimer = undefined;
-        }
         await this.waitForIdle(this.shutdownIdleWaitMillis);
 
         this.flushPendingCompletions();
@@ -282,7 +240,6 @@ export class TransactionSpanProcessor implements SpanProcessor {
         }
         this.buffers.clear();
         this.liveParents.clear();
-        await this.flushHarvest();
         await this.awaitPendingExports();
         this.exporterShutdown = true;
         this.membership.clear();
@@ -464,7 +421,7 @@ export class TransactionSpanProcessor implements SpanProcessor {
      * 1) stamp final transaction names
      * 2) stamp self duration + metrics
      * 3) trim nodes
-     * 4) harvest or export
+     * 4) export
      */
     private acceptCompleted(spans: ReadableSpan[]): void {
         const intervalSnapshot = new Map<string, Array<{startNs: bigint; endNs: bigint}>>();
@@ -488,34 +445,11 @@ export class TransactionSpanProcessor implements SpanProcessor {
                 return;
             }
 
-            if (
-                this.maxRegularTraces <= 0
-                || this.harvestPeriodMillis <= 0
-                || this.stopped
-                || this.exporterShutdown
-            ) {
-                this.exportSpans(trimmed);
-                return;
-            }
-
-            const stubs = this.harvest.witness({
-                durationNs: rootDurationNs(trimmed),
-                spans: trimmed,
-            });
-            if (stubs.length > 0) {
-                this.exportSpans(stubs);
-            }
+            this.exportSpans(trimmed);
         } finally {
             for (const span of spans) {
                 this.childIntervals.delete(span.spanContext().spanId);
             }
-        }
-    }
-
-    private async flushHarvest(): Promise<void> {
-        const winners = this.harvest.drain();
-        for (const winner of winners) {
-            await this.exportSpansAsync(winner.spans);
         }
     }
 

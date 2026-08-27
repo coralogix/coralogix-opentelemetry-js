@@ -1,7 +1,7 @@
 /**
  * Binary min-heap helpers.
  *
- * Used by harvest and node-trim to keep a bounded set of larger values:
+ * Used by node-trim to keep a bounded set of larger values:
  * the heap head is the smallest (shortest duration) and is the easiest to
  * displace when a longer candidate arrives.
  */
