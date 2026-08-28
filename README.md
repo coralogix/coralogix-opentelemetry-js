@@ -74,10 +74,10 @@ When a span starts a transaction, the sampler adds the following attributes:
 
 Transaction **membership** (new vs inherit, and `cgx.transaction.root`) is decided on span start. The display name `cgx.transaction` is stamped only when a completed local trace is finalized for export, using `overrideName ?? rootSpan.name`. That matters for Express: the HTTP span often starts as `GET` and is later renamed to `GET /myroute` by middleware — the exported transaction name is the final root span name.
 
-Every completed local trace is exported immediately. The first 256 spans in a
-finalized batch (the processor's completion order) receive
-`cgx.transaction.self_duration` and its histogram metrics. Later spans still
-export, without those self-duration values, to bound calculation cost.
+Every completed local trace is exported immediately. The processor buffers up
+to 256 completed spans for transaction enrichment. When the 257th span ends,
+it immediately exports the buffered spans and streams later spans unchanged;
+that trace receives no processor transaction tags, self-duration, or metrics.
 
 ```js
 import { BasicTracerProvider, ConsoleSpanExporter } from "@opentelemetry/sdk-trace-base";

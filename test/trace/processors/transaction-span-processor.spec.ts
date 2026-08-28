@@ -210,7 +210,7 @@ export default describe('TransactionSpanProcessor', () => {
         await meterProvider.shutdown();
     });
 
-    it('exports all 260 spans but stamps self duration and metrics only on the first 256', async () => {
+    it('exports all 260 spans without transaction or self-duration enrichment', async () => {
         const previousMaxNodes = process.env.OTEL_CX_TRANSACTION_MAX_NODES;
         process.env.OTEL_CX_TRANSACTION_MAX_NODES = '1';
         const {provider, tracer, exporter, reader, meterProvider} = buildProvider();
@@ -236,9 +236,10 @@ export default describe('TransactionSpanProcessor', () => {
 
         const spans = exporter.getFinishedSpans();
         assert.strictEqual(spans.length, 260, 'large transactions must export every span');
-        assert.ok(spans.slice(0, 256).every((span) => CoralogixAttributes.SELF_DURATION in span.attributes));
-        assert.ok(spans.slice(256).every((span) => !(CoralogixAttributes.SELF_DURATION in span.attributes)));
-        assert.strictEqual(await selfDurationMetricPointCount(reader), 256);
+        assert.ok(spans.every((span) => !(CoralogixAttributes.TRANSACTION_IDENTIFIER in span.attributes)));
+        assert.ok(spans.every((span) => !(CoralogixAttributes.TRANSACTION_ROOT in span.attributes)));
+        assert.ok(spans.every((span) => !(CoralogixAttributes.SELF_DURATION in span.attributes)));
+        assert.strictEqual(await selfDurationMetricPointCount(reader), 0);
 
         await provider.shutdown();
         await meterProvider.shutdown();

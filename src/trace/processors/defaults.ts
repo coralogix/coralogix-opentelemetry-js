@@ -1,4 +1,4 @@
-/** Maximum finalized-batch spans that receive self-duration work. */
+/** Maximum finalized-batch spans eligible for transaction enrichment. */
 
 export const MAX_SELF_DURATION_SPANS = 256;
 export const DEFAULT_COMPLETION_HOLDBACK_MILLIS = 100;
