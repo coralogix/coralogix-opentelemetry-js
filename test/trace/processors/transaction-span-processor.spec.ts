@@ -50,6 +50,14 @@ class StickySpanExporter implements SpanExporter {
     }
 }
 
+async function selfDurationMetricPointCount(reader: TestMetricReader): Promise<number> {
+    const {resourceMetrics} = await reader.collect();
+    return resourceMetrics.scopeMetrics
+        .flatMap((scope) => scope.metrics)
+        .filter((metric) => metric.descriptor.name === METRIC_SELF_DURATION)
+        .reduce((count, metric) => count + metric.dataPoints.length, 0);
+}
+
 // `TransactionSpanProcessor` now owns all transaction tagging logic, so it's used here with no
 // sampler at all (a plain `BasicTracerProvider` default-samples everything).
 function buildProvider() {
@@ -171,6 +179,66 @@ export default describe('TransactionSpanProcessor', () => {
         const {resourceMetrics} = await reader.collect();
         const metricNames = resourceMetrics.scopeMetrics.flatMap((sm) => sm.metrics.map((m) => m.descriptor.name));
         assert.ok(metricNames.includes(METRIC_SELF_DURATION), `expected ${METRIC_SELF_DURATION} metric to have been recorded`);
+
+        await provider.shutdown();
+        await meterProvider.shutdown();
+    });
+
+    it('stamps self duration and metrics on every span in a 130-span transaction', async () => {
+        const {provider, tracer, exporter, reader, meterProvider} = buildProvider();
+        const root = tracer.startSpan('medium transaction', {kind: SpanKind.SERVER});
+        const context = opentelemetry.trace.setSpan(ROOT_CONTEXT, root);
+        const children = Array.from(
+            {length: 129},
+            (_, index) => tracer.startSpan(`child-${index}`, {}, context),
+        );
+
+        for (const child of children) {
+            child.end();
+        }
+        root.end();
+
+        await provider.forceFlush();
+        await meterProvider.forceFlush();
+
+        const spans = exporter.getFinishedSpans();
+        assert.strictEqual(spans.length, 130);
+        assert.ok(spans.every((span) => CoralogixAttributes.SELF_DURATION in span.attributes));
+        assert.strictEqual(await selfDurationMetricPointCount(reader), 130);
+
+        await provider.shutdown();
+        await meterProvider.shutdown();
+    });
+
+    it('exports all 260 spans but stamps self duration and metrics only on the first 256', async () => {
+        const previousMaxNodes = process.env.OTEL_CX_TRANSACTION_MAX_NODES;
+        process.env.OTEL_CX_TRANSACTION_MAX_NODES = '1';
+        const {provider, tracer, exporter, reader, meterProvider} = buildProvider();
+        if (previousMaxNodes === undefined) {
+            delete process.env.OTEL_CX_TRANSACTION_MAX_NODES;
+        } else {
+            process.env.OTEL_CX_TRANSACTION_MAX_NODES = previousMaxNodes;
+        }
+        const root = tracer.startSpan('large transaction', {kind: SpanKind.SERVER});
+        const context = opentelemetry.trace.setSpan(ROOT_CONTEXT, root);
+        const children = Array.from(
+            {length: 259},
+            (_, index) => tracer.startSpan(`child-${index}`, {}, context),
+        );
+
+        for (const child of children) {
+            child.end();
+        }
+        root.end();
+
+        await provider.forceFlush();
+        await meterProvider.forceFlush();
+
+        const spans = exporter.getFinishedSpans();
+        assert.strictEqual(spans.length, 260, 'large transactions must export every span');
+        assert.ok(spans.slice(0, 256).every((span) => CoralogixAttributes.SELF_DURATION in span.attributes));
+        assert.ok(spans.slice(256).every((span) => !(CoralogixAttributes.SELF_DURATION in span.attributes)));
+        assert.strictEqual(await selfDurationMetricPointCount(reader), 256);
 
         await provider.shutdown();
         await meterProvider.shutdown();

@@ -8,11 +8,10 @@ import {
     trace,
 } from "@opentelemetry/api";
 import {ReadableSpan, Span, SpanExporter, SpanProcessor} from "@opentelemetry/sdk-trace-base";
-import {CoralogixAttributes, METRIC_SELF_DURATION} from "../common";
-import {DEFAULT_SHUTDOWN_IDLE_WAIT_MILLIS} from "./defaults";
+import {METRIC_SELF_DURATION} from "../common";
+import {DEFAULT_SHUTDOWN_IDLE_WAIT_MILLIS, MAX_SELF_DURATION_SPANS} from "./defaults";
 import {resolveProcessorOptions} from "./env-options";
 import {stampSelfDurationAndMetrics} from "./self-duration-stamp";
-import {selectSlowestSpans} from "./trace-heap";
 import {
     extractCompletedLocalTransactions,
     hasExtractableNestedTransaction,
@@ -24,12 +23,6 @@ const INSTRUMENTATION_SCOPE_NAME = "coralogix.opentelemetry.transaction";
 export interface TransactionSpanProcessorOptions {
     /** MeterProvider used to create the self-duration histogram. Defaults to the global MeterProvider. */
     meterProvider?: MeterProvider;
-    /**
-     * Keep at most this many spans per completed local trace (slowest first;
-     * transaction root always kept). Default 256.
-     * Env: `OTEL_CX_TRANSACTION_MAX_NODES`.
-     */
-    maxNodes?: number;
     /**
      * After the last live span in a local trace ends, wait this long before
      * finalizing so fire-and-forget children that start on the same traceId
@@ -43,12 +36,12 @@ export interface TransactionSpanProcessorOptions {
 
 export {
     DEFAULT_COMPLETION_HOLDBACK_MILLIS,
-    DEFAULT_MAX_TXN_TRACE_NODES,
 } from "./defaults";
 
 /**
- * Tags Coralogix transactions, stamps exclusive self duration, trims nodes,
- * and exports every completed trimmed local trace.
+ * Tags Coralogix transactions and exports every completed local trace.
+ * Self duration and its metrics are stamped only on the first 256 spans in
+ * finalized-batch (completion) order.
  *
  * Flow:
  * - **onStart**: track live spans; decide new vs inherit transaction; set
@@ -56,7 +49,7 @@ export {
  *   from the early span name (Express may rename later).
  * - **onEnd / holdback**: buffer until the local transaction subtree is idle.
  * - **acceptCompleted (export finalize)**: stamp final `cgx.transaction` from
- *   `overrideName ?? rootSpan.name`, then self duration + metrics, trim, export.
+ *   `overrideName ?? rootSpan.name`, then optionally self duration + metrics, export.
  */
 export class TransactionSpanProcessor implements SpanProcessor {
     private readonly exporter: SpanExporter;
@@ -65,7 +58,6 @@ export class TransactionSpanProcessor implements SpanProcessor {
     private readonly liveParents = new Map<string, Map<string, string | undefined>>();
     private readonly membership = new TransactionMembershipTracker();
     private readonly selfDurationHistogram: Histogram;
-    private readonly maxNodes: number;
     private readonly completionHoldbackMillis: number;
     private readonly shutdownIdleWaitMillis: number;
     /** traceId -> holdback timer after last live span ended */
@@ -85,7 +77,6 @@ export class TransactionSpanProcessor implements SpanProcessor {
     constructor(exporter: SpanExporter, options: TransactionSpanProcessorOptions = {}) {
         this.exporter = exporter;
         const resolved = resolveProcessorOptions(options);
-        this.maxNodes = resolved.maxNodes;
         this.completionHoldbackMillis = resolved.completionHoldbackMillis;
         this.shutdownIdleWaitMillis = options.shutdownIdleWaitMillis ?? DEFAULT_SHUTDOWN_IDLE_WAIT_MILLIS;
         const meter = (options.meterProvider ?? metrics.getMeterProvider()).getMeter(INSTRUMENTATION_SCOPE_NAME);
@@ -419,33 +410,25 @@ export class TransactionSpanProcessor implements SpanProcessor {
     /**
      * Export finalize for one completed local transaction batch:
      * 1) stamp final transaction names
-     * 2) stamp self duration + metrics
-     * 3) trim nodes
-     * 4) export
+     * 2) stamp self duration + metrics for the first 256 completed spans
+     * 3) export every span
      */
     private acceptCompleted(spans: ReadableSpan[]): void {
-        const intervalSnapshot = new Map<string, Array<{startNs: bigint; endNs: bigint}>>();
-        for (const span of spans) {
-            const spanId = span.spanContext().spanId;
-            const intervals = this.childIntervals.get(spanId);
-            if (intervals && intervals.length > 0) {
-                intervalSnapshot.set(spanId, intervals.slice());
-            }
-        }
-
         try {
             this.membership.finalizeBatchNames(spans);
-            stampSelfDurationAndMetrics(spans, intervalSnapshot, this.selfDurationHistogram);
-
-            const rootSpanIds = spans
-                .filter((span) => span.attributes[CoralogixAttributes.TRANSACTION_ROOT] === true)
-                .map((span) => span.spanContext().spanId);
-            const trimmed = selectSlowestSpans(spans, this.maxNodes, rootSpanIds);
-            if (trimmed.length === 0) {
-                return;
+            const selfDurationSpans = spans.slice(0, MAX_SELF_DURATION_SPANS);
+            if (selfDurationSpans.length > 0) {
+                const intervalSnapshot = new Map<string, Array<{startNs: bigint; endNs: bigint}>>();
+                for (const span of selfDurationSpans) {
+                    const spanId = span.spanContext().spanId;
+                    const intervals = this.childIntervals.get(spanId);
+                    if (intervals && intervals.length > 0) {
+                        intervalSnapshot.set(spanId, intervals.slice());
+                    }
+                }
+                stampSelfDurationAndMetrics(selfDurationSpans, intervalSnapshot, this.selfDurationHistogram);
             }
-
-            this.exportSpans(trimmed);
+            this.exportSpans(spans);
         } finally {
             for (const span of spans) {
                 this.childIntervals.delete(span.spanContext().spanId);
