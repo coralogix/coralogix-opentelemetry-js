@@ -52,15 +52,13 @@ class StickySpanExporter implements SpanExporter {
 
 // `TransactionSpanProcessor` now owns all transaction tagging logic, so it's used here with no
 // sampler at all (a plain `BasicTracerProvider` default-samples everything).
-function buildProvider(options: {maxRegularTraces?: number} = {}) {
+function buildProvider() {
     const exporter = new InMemorySpanExporter();
     const reader = new TestMetricReader();
     const meterProvider = new MeterProvider({readers: [reader]});
     const provider = new BasicTracerProvider({
         spanProcessors: [new TransactionSpanProcessor(exporter, {
             meterProvider,
-            // Tests that assert immediate export use the escape hatch.
-            maxRegularTraces: options.maxRegularTraces ?? 0,
         })],
     });
     return {provider, tracer: provider.getTracer('test'), exporter, reader, meterProvider};
@@ -292,57 +290,6 @@ export default describe('TransactionSpanProcessor', () => {
         await meterProvider.shutdown();
     });
 
-    it('harvest keeps only the slowest completed local trace until forceFlush', async () => {
-        const exporter = new InMemorySpanExporter();
-        const reader = new TestMetricReader();
-        const meterProvider = new MeterProvider({readers: [reader]});
-        const processor = new TransactionSpanProcessor(exporter, {
-            meterProvider,
-            maxRegularTraces: 1,
-            harvestPeriodMillis: 60_000,
-            completionHoldbackMillis: 0,
-        });
-        const provider = new BasicTracerProvider({spanProcessors: [processor]});
-        const tracer = provider.getTracer('test');
-
-        const fast = tracer.startSpan('fast', {
-            kind: SpanKind.SERVER,
-            startTime: [1, 0],
-        });
-        fast.end([1, 50_000_000]);
-
-        const slow = tracer.startSpan('slow', {
-            kind: SpanKind.SERVER,
-            startTime: [2, 0],
-        });
-        slow.end([2, 500_000_000]);
-
-        await new Promise((resolve) => setImmediate(resolve));
-        const beforeFlush = exporter.getFinishedSpans();
-        assert.strictEqual(beforeFlush.length, 1, 'displaced fast loser must stub-export immediately');
-        assert.strictEqual(beforeFlush[0]!.name, 'fast');
-
-        await provider.forceFlush();
-        await meterProvider.forceFlush();
-        const exported = exporter.getFinishedSpans();
-        assert.strictEqual(exported.length, 2, 'slowest full waterfall + stub root for the loser');
-        const names = new Set(exported.map((s) => s.name));
-        assert.ok(names.has('slow'));
-        assert.ok(names.has('fast'));
-
-        const {resourceMetrics} = await reader.collect();
-        const metricNames = resourceMetrics.scopeMetrics.flatMap((sm) =>
-            sm.metrics.map((m) => m.descriptor.name),
-        );
-        assert.ok(
-            metricNames.includes(METRIC_SELF_DURATION),
-            'metrics are recorded even for traces that lose the harvest',
-        );
-
-        await provider.shutdown();
-        await meterProvider.shutdown();
-    });
-
     it('preserves a pre-set cgx.transaction name (e.g. sampler Express template)', async () => {
         const {provider, tracer, exporter, meterProvider} = buildProvider();
 
@@ -371,7 +318,6 @@ export default describe('TransactionSpanProcessor', () => {
         const meterProvider = new MeterProvider({readers: [reader]});
         const processor = new TransactionSpanProcessor(exporter, {
             meterProvider,
-            maxRegularTraces: 0,
             shutdownIdleWaitMillis: 20,
         });
         const provider = new BasicTracerProvider({spanProcessors: [processor]});
@@ -405,7 +351,6 @@ export default describe('TransactionSpanProcessor', () => {
         const meterProvider = new MeterProvider({readers: [reader]});
         const processor = new TransactionSpanProcessor(exporter, {
             meterProvider,
-            maxRegularTraces: 0,
             shutdownIdleWaitMillis: 500,
         });
         const provider = new BasicTracerProvider({spanProcessors: [processor]});
@@ -471,39 +416,12 @@ export default describe('TransactionSpanProcessor', () => {
         await meterProvider.shutdown();
     });
 
-    it('exports immediately when harvestPeriodMillis is 0 (no silent heap drop)', async () => {
-        const exporter = new InMemorySpanExporter();
-        const reader = new TestMetricReader();
-        const meterProvider = new MeterProvider({readers: [reader]});
-        const processor = new TransactionSpanProcessor(exporter, {
-            meterProvider,
-            maxRegularTraces: 1,
-            harvestPeriodMillis: 0,
-        });
-        const provider = new BasicTracerProvider({spanProcessors: [processor]});
-        const tracer = provider.getTracer('test');
-
-        const root = tracer.startSpan('solo', {kind: SpanKind.SERVER});
-        root.end();
-
-        await provider.forceFlush();
-        assert.strictEqual(
-            exporter.getFinishedSpans().length,
-            1,
-            'period 0 must export without waiting for harvest timer',
-        );
-
-        await provider.shutdown();
-        await meterProvider.shutdown();
-    });
-
     it('exports nested SERVER transaction before outer ancestor ends', async () => {
         const exporter = new StickySpanExporter();
         const reader = new TestMetricReader();
         const meterProvider = new MeterProvider({readers: [reader]});
         const processor = new TransactionSpanProcessor(exporter, {
             meterProvider,
-            maxRegularTraces: 0,
             completionHoldbackMillis: 0,
         });
         const provider = new BasicTracerProvider({spanProcessors: [processor]});
@@ -546,7 +464,6 @@ export default describe('TransactionSpanProcessor', () => {
         const meterProvider = new MeterProvider({readers: [reader]});
         const processor = new TransactionSpanProcessor(exporter, {
             meterProvider,
-            maxRegularTraces: 0,
             completionHoldbackMillis: 50,
         });
         const provider = new BasicTracerProvider({spanProcessors: [processor]});
@@ -587,7 +504,6 @@ export default describe('TransactionSpanProcessor', () => {
         const meterProvider = new MeterProvider({readers: [reader]});
         const processor = new TransactionSpanProcessor(exporter, {
             meterProvider,
-            maxRegularTraces: 0,
             completionHoldbackMillis: 50,
         });
         const provider = new BasicTracerProvider({spanProcessors: [processor]});
@@ -637,7 +553,6 @@ export default describe('TransactionSpanProcessor', () => {
         const meterProvider = new MeterProvider({readers: [reader]});
         const processor = new TransactionSpanProcessor(exporter, {
             meterProvider,
-            maxRegularTraces: 0,
             completionHoldbackMillis: 0,
         });
         const provider = new BasicTracerProvider({spanProcessors: [processor]});
@@ -686,7 +601,6 @@ export default describe('TransactionSpanProcessor', () => {
         const meterProvider = new MeterProvider({readers: [reader]});
         const processor = new TransactionSpanProcessor(exporter, {
             meterProvider,
-            maxRegularTraces: 0,
             completionHoldbackMillis: 0,
         });
         const provider = new BasicTracerProvider({spanProcessors: [processor]});
@@ -739,16 +653,12 @@ export default describe('TransactionSpanProcessor', () => {
         await meterProvider.shutdown();
     });
 
-    it('shutdown exports completed traces immediately when harvest is enabled', async () => {
-        // Completing after stopped=true must export now, not witness into a
-        // harvest heap that shutdown may already have drained.
+    it('shutdown exports completed traces immediately', async () => {
         const exporter = new StickySpanExporter();
         const reader = new TestMetricReader();
         const meterProvider = new MeterProvider({readers: [reader]});
         const processor = new TransactionSpanProcessor(exporter, {
             meterProvider,
-            maxRegularTraces: 1,
-            harvestPeriodMillis: 60_000,
             completionHoldbackMillis: 0,
             shutdownIdleWaitMillis: 500,
         });
@@ -769,7 +679,7 @@ export default describe('TransactionSpanProcessor', () => {
         assert.strictEqual(
             spans.length,
             1,
-            'completed trace during shutdown must export, not be lost in harvest',
+            'completed trace during shutdown must export',
         );
         assert.strictEqual(spans[0]!.name, 'late');
 
@@ -784,7 +694,6 @@ export default describe('TransactionSpanProcessor', () => {
         const meterProvider = new MeterProvider({readers: [reader]});
         const processor = new TransactionSpanProcessor(exporter, {
             meterProvider,
-            maxRegularTraces: 0,
             completionHoldbackMillis: 0,
         });
         const provider = new BasicTracerProvider({spanProcessors: [processor]});
@@ -823,7 +732,6 @@ export default describe('TransactionSpanProcessor', () => {
         const meterProvider = new MeterProvider({readers: [reader]});
         const processor = new TransactionSpanProcessor(exporter, {
             meterProvider,
-            maxRegularTraces: 0,
             completionHoldbackMillis: 80,
             shutdownIdleWaitMillis: 10,
         });
