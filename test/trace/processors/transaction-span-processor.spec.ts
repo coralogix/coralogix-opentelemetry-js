@@ -211,14 +211,7 @@ export default describe('TransactionSpanProcessor', () => {
     });
 
     it('exports all 260 spans without transaction or self-duration enrichment', async () => {
-        const previousMaxNodes = process.env.OTEL_CX_TRANSACTION_MAX_NODES;
-        process.env.OTEL_CX_TRANSACTION_MAX_NODES = '1';
         const {provider, tracer, exporter, reader, meterProvider} = buildProvider();
-        if (previousMaxNodes === undefined) {
-            delete process.env.OTEL_CX_TRANSACTION_MAX_NODES;
-        } else {
-            process.env.OTEL_CX_TRANSACTION_MAX_NODES = previousMaxNodes;
-        }
         const root = tracer.startSpan('large transaction', {kind: SpanKind.SERVER});
         const context = opentelemetry.trace.setSpan(ROOT_CONTEXT, root);
         const children = Array.from(
@@ -241,6 +234,30 @@ export default describe('TransactionSpanProcessor', () => {
         assert.ok(spans.every((span) => !(CoralogixAttributes.SELF_DURATION in span.attributes)));
         assert.strictEqual(await selfDurationMetricPointCount(reader), 0);
 
+        await provider.shutdown();
+        await meterProvider.shutdown();
+    });
+
+    it('flushes 257 raw spans before the still-live root ends', async () => {
+        const {provider, tracer, exporter, reader, meterProvider} = buildProvider();
+        const root = tracer.startSpan('large streaming transaction', {kind: SpanKind.SERVER});
+        const context = opentelemetry.trace.setSpan(ROOT_CONTEXT, root);
+        for (let index = 1; index <= 257; index++) {
+            const child = tracer.startSpan(`child-${index}`, {}, context);
+            child.end();
+        }
+
+        await sleep(10);
+        const flushed = exporter.getFinishedSpans();
+        assert.strictEqual(flushed.length, 257);
+        assert.ok(flushed.every((span) => !(CoralogixAttributes.TRANSACTION_IDENTIFIER in span.attributes)));
+        assert.ok(flushed.every((span) => !(CoralogixAttributes.TRANSACTION_ROOT in span.attributes)));
+        assert.ok(flushed.every((span) => !(CoralogixAttributes.SELF_DURATION in span.attributes)));
+        assert.strictEqual(await selfDurationMetricPointCount(reader), 0);
+
+        root.end();
+        await provider.forceFlush();
+        assert.strictEqual(exporter.getFinishedSpans().length, 258);
         await provider.shutdown();
         await meterProvider.shutdown();
     });
