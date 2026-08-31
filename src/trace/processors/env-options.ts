@@ -1,13 +1,16 @@
 import {
     DEFAULT_COMPLETION_HOLDBACK_MILLIS,
-    DEFAULT_MAX_TXN_TRACE_NODES,
+    DEFAULT_MAX_TRACES,
+    DEFAULT_MAX_TRANSACTION_SPANS,
     ENV_COMPLETION_HOLDBACK_MILLIS,
-    ENV_MAX_NODES,
+    ENV_MAX_TRACES,
+    ENV_MAX_TRANSACTION_SPANS,
 } from "./defaults";
 
 export interface EnvResolvedProcessorOptions {
-    maxNodes: number;
     completionHoldbackMillis: number;
+    maxTransactionSpans: number;
+    maxTraces: number;
 }
 
 /**
@@ -15,15 +18,25 @@ export interface EnvResolvedProcessorOptions {
  * Invalid / non-finite env values fall back to the default.
  */
 export function resolveProcessorOptions(options: {
-    maxNodes?: number;
     completionHoldbackMillis?: number;
+    maxTransactionSpans?: number;
+    maxTraces?: number;
 }, env: NodeJS.ProcessEnv = process.env): EnvResolvedProcessorOptions {
     return {
-        maxNodes: pickInt(options.maxNodes, env[ENV_MAX_NODES], DEFAULT_MAX_TXN_TRACE_NODES),
         completionHoldbackMillis: pickInt(
             options.completionHoldbackMillis,
             env[ENV_COMPLETION_HOLDBACK_MILLIS],
             DEFAULT_COMPLETION_HOLDBACK_MILLIS,
+        ),
+        maxTransactionSpans: pickInt(
+            options.maxTransactionSpans,
+            env[ENV_MAX_TRANSACTION_SPANS],
+            DEFAULT_MAX_TRANSACTION_SPANS,
+        ),
+        maxTraces: pickInt(
+            options.maxTraces,
+            env[ENV_MAX_TRACES],
+            DEFAULT_MAX_TRACES,
         ),
     };
 }

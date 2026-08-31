@@ -12,7 +12,6 @@ import {CoralogixAttributes, METRIC_SELF_DURATION} from "../common";
 import {DEFAULT_SHUTDOWN_IDLE_WAIT_MILLIS} from "./defaults";
 import {resolveProcessorOptions} from "./env-options";
 import {stampSelfDurationAndMetrics} from "./self-duration-stamp";
-import {selectSlowestSpans} from "./trace-heap";
 import {
     extractCompletedLocalTransactions,
     hasExtractableNestedTransaction,
@@ -25,30 +24,28 @@ export interface TransactionSpanProcessorOptions {
     /** MeterProvider used to create the self-duration histogram. Defaults to the global MeterProvider. */
     meterProvider?: MeterProvider;
     /**
-     * Keep at most this many spans per completed local trace (slowest first;
-     * transaction root always kept). Default 256.
-     * Env: `OTEL_CX_TRANSACTION_MAX_NODES`.
-     */
-    maxNodes?: number;
-    /**
      * After the last live span in a local trace ends, wait this long before
      * finalizing so fire-and-forget children that start on the same traceId
      * can still join. Default 100. Set to 0 to finalize immediately.
      * Env: `OTEL_CX_TRANSACTION_COMPLETION_HOLDBACK_MILLIS`.
      */
     completionHoldbackMillis?: number;
+    /** Maximum spans buffered for one trace. Env: `CORALOGIX_MAX_SPANS_PER_TRACE`. */
+    maxTransactionSpans?: number;
+    /** Maximum transactions retained in memory. Env: `CORALOGIX_MAX_TRANSACTION_TRACES`. */
+    maxTraces?: number;
     /** How long shutdown waits for in-flight spans. Default 30_000. */
     shutdownIdleWaitMillis?: number;
 }
 
 export {
     DEFAULT_COMPLETION_HOLDBACK_MILLIS,
-    DEFAULT_MAX_TXN_TRACE_NODES,
 } from "./defaults";
 
 /**
- * Tags Coralogix transactions, stamps exclusive self duration, trims nodes,
- * and exports every completed trimmed local trace.
+ * Tags Coralogix transactions and exports every completed local trace.
+ * Self duration and its metrics are stamped only on the first 256 spans in
+ * finalized-batch (completion) order.
  *
  * Flow:
  * - **onStart**: track live spans; decide new vs inherit transaction; set
@@ -56,17 +53,21 @@ export {
  *   from the early span name (Express may rename later).
  * - **onEnd / holdback**: buffer until the local transaction subtree is idle.
  * - **acceptCompleted (export finalize)**: stamp final `cgx.transaction` from
- *   `overrideName ?? rootSpan.name`, then self duration + metrics, trim, export.
+ *   `overrideName ?? rootSpan.name`, then optionally self duration + metrics, export.
  */
 export class TransactionSpanProcessor implements SpanProcessor {
     private readonly exporter: SpanExporter;
     private readonly buffers = new Map<string, ReadableSpan[]>();
+    /** Traces that crossed 256 ended spans and now bypass transaction processing. */
+    private readonly passthroughTraces = new Set<string>();
+    private readonly passthroughCleanup = new Map<string, ReturnType<typeof setTimeout>>();
     /** traceId -> (spanId -> parentSpanId) for still-running spans */
     private readonly liveParents = new Map<string, Map<string, string | undefined>>();
     private readonly membership = new TransactionMembershipTracker();
     private readonly selfDurationHistogram: Histogram;
-    private readonly maxNodes: number;
     private readonly completionHoldbackMillis: number;
+    private readonly maxTransactionSpans: number;
+    private readonly maxTraces: number;
     private readonly shutdownIdleWaitMillis: number;
     /** traceId -> holdback timer after last live span ended */
     private readonly pendingCompletions = new Map<string, ReturnType<typeof setTimeout>>();
@@ -85,8 +86,9 @@ export class TransactionSpanProcessor implements SpanProcessor {
     constructor(exporter: SpanExporter, options: TransactionSpanProcessorOptions = {}) {
         this.exporter = exporter;
         const resolved = resolveProcessorOptions(options);
-        this.maxNodes = resolved.maxNodes;
         this.completionHoldbackMillis = resolved.completionHoldbackMillis;
+        this.maxTransactionSpans = resolved.maxTransactionSpans;
+        this.maxTraces = resolved.maxTraces;
         this.shutdownIdleWaitMillis = options.shutdownIdleWaitMillis ?? DEFAULT_SHUTDOWN_IDLE_WAIT_MILLIS;
         const meter = (options.meterProvider ?? metrics.getMeterProvider()).getMeter(INSTRUMENTATION_SCOPE_NAME);
         this.selfDurationHistogram = meter.createHistogram(METRIC_SELF_DURATION, {
@@ -104,7 +106,17 @@ export class TransactionSpanProcessor implements SpanProcessor {
             return;
         }
 
-        try {
+        const {traceId, spanId} = span.spanContext();
+        if (
+            this.maxTraces > 0
+            && !this.passthroughTraces.has(traceId)
+            && !this.liveParents.has(traceId)
+            && !this.buffers.has(traceId)
+            && this.bufferedTraceCount() >= this.maxTraces
+        ) {
+            this.passthroughTraces.add(traceId);
+        }
+        if (!this.passthroughTraces.has(traceId)) try {
             this.membership.trackOnStart(span, parentContext);
         } catch (error) {
             diag.debug(
@@ -117,8 +129,9 @@ export class TransactionSpanProcessor implements SpanProcessor {
             return;
         }
 
-        const {traceId, spanId} = span.spanContext();
         const parentId = trace.getSpanContext(parentContext)?.spanId;
+
+        this.cancelPassthroughCleanup(traceId);
 
         this.cancelPendingCompletion(traceId);
 
@@ -149,8 +162,18 @@ export class TransactionSpanProcessor implements SpanProcessor {
             return;
         }
 
+        if (this.passthroughTraces.has(traceId)) {
+            this.finishPassthroughSpan(traceId, span, live);
+            return;
+        }
+
         const parentId = span.parentSpanContext?.spanId;
-        const buffer = this.buffers.get(traceId) ?? [];
+        const existingBuffer = this.buffers.get(traceId);
+        if (this.maxTraces > 0 && !existingBuffer && !live && this.bufferedTraceCount() >= this.maxTraces) {
+            this.enterPassthrough(traceId, [span]);
+            return;
+        }
+        const buffer = existingBuffer ?? [];
         // Only retain intervals for parents we track locally. Remote / external
         // parent IDs are never cleaned by acceptCompleted and would leak.
         if (parentId && this.isLocalParent(parentId, live, buffer)) {
@@ -170,6 +193,11 @@ export class TransactionSpanProcessor implements SpanProcessor {
             if (live.size === 0) {
                 this.liveParents.delete(traceId);
             }
+        }
+
+        if (buffer.length > this.maxTransactionSpans) {
+            this.enterPassthrough(traceId, buffer);
+            return;
         }
 
         const stillLive = this.liveParents.get(traceId);
@@ -240,6 +268,9 @@ export class TransactionSpanProcessor implements SpanProcessor {
         }
         this.buffers.clear();
         this.liveParents.clear();
+        this.passthroughTraces.clear();
+        for (const timer of this.passthroughCleanup.values()) clearTimeout(timer);
+        this.passthroughCleanup.clear();
         await this.awaitPendingExports();
         this.exporterShutdown = true;
         this.membership.clear();
@@ -261,6 +292,53 @@ export class TransactionSpanProcessor implements SpanProcessor {
             clearTimeout(timer);
             this.pendingNestedCompletions.delete(traceId);
         }
+    }
+
+    private cancelPassthroughCleanup(traceId: string): void {
+        const timer = this.passthroughCleanup.get(traceId);
+        if (timer !== undefined) {
+            clearTimeout(timer);
+            this.passthroughCleanup.delete(traceId);
+        }
+    }
+
+    private enterPassthrough(traceId: string, spans: ReadableSpan[]): void {
+        this.cancelPendingCompletion(traceId);
+        this.cancelPendingNestedCompletion(traceId);
+        this.passthroughTraces.add(traceId);
+        this.buffers.delete(traceId);
+        this.membership.clearTrace(traceId);
+        this.exportSpans(spans);
+        for (const span of spans) this.childIntervals.delete(span.spanContext().spanId);
+        for (const spanId of this.liveParents.get(traceId)?.keys() ?? []) this.childIntervals.delete(spanId);
+        if (!this.liveParents.has(traceId)) this.schedulePassthroughCleanup(traceId);
+    }
+
+    private finishPassthroughSpan(
+        traceId: string,
+        span: ReadableSpan,
+        live: Map<string, string | undefined> | undefined,
+    ): void {
+        if (live) {
+            live.delete(span.spanContext().spanId);
+            if (live.size === 0) this.liveParents.delete(traceId);
+        }
+        this.exportSpans([span]);
+        this.childIntervals.delete(span.spanContext().spanId);
+        if (!this.liveParents.has(traceId)) this.schedulePassthroughCleanup(traceId);
+    }
+
+    private schedulePassthroughCleanup(traceId: string): void {
+        this.cancelPassthroughCleanup(traceId);
+        const cleanup = () => {
+            this.passthroughCleanup.delete(traceId);
+            if (!this.liveParents.has(traceId)) this.passthroughTraces.delete(traceId);
+        };
+        if (this.completionHoldbackMillis <= 0) {
+            cleanup();
+            return;
+        }
+        this.passthroughCleanup.set(traceId, setTimeout(cleanup, this.completionHoldbackMillis));
     }
 
     private isLocalParent(
@@ -416,40 +494,50 @@ export class TransactionSpanProcessor implements SpanProcessor {
         return n;
     }
 
+    private bufferedTraceCount(): number {
+        const traceIds = new Set([...this.liveParents.keys(), ...this.buffers.keys()]);
+        let count = 0;
+        for (const traceId of traceIds) {
+            if (!this.passthroughTraces.has(traceId)) count += 1;
+        }
+        return count;
+    }
+
     /**
      * Export finalize for one completed local transaction batch:
-     * 1) stamp final transaction names
-     * 2) stamp self duration + metrics
-     * 3) trim nodes
-     * 4) export
+     * 1) enrich batches up to 256 spans with transaction names and self duration
+     * 2) export every span; larger batches remain untouched
      */
     private acceptCompleted(spans: ReadableSpan[]): void {
-        const intervalSnapshot = new Map<string, Array<{startNs: bigint; endNs: bigint}>>();
-        for (const span of spans) {
-            const spanId = span.spanContext().spanId;
-            const intervals = this.childIntervals.get(spanId);
-            if (intervals && intervals.length > 0) {
-                intervalSnapshot.set(spanId, intervals.slice());
-            }
-        }
-
         try {
-            this.membership.finalizeBatchNames(spans);
-            stampSelfDurationAndMetrics(spans, intervalSnapshot, this.selfDurationHistogram);
-
-            const rootSpanIds = spans
-                .filter((span) => span.attributes[CoralogixAttributes.TRANSACTION_ROOT] === true)
-                .map((span) => span.spanContext().spanId);
-            const trimmed = selectSlowestSpans(spans, this.maxNodes, rootSpanIds);
-            if (trimmed.length === 0) {
+            if (spans.length > this.maxTransactionSpans) {
+                this.exportSpans(spans);
                 return;
             }
-
-            this.exportSpans(trimmed);
+            this.membership.finalizeBatchNames(spans);
+            if (spans.length > 0) {
+                const intervalSnapshot = new Map<string, Array<{startNs: bigint; endNs: bigint}>>();
+                for (const span of spans) {
+                    const spanId = span.spanContext().spanId;
+                    const intervals = this.childIntervals.get(spanId);
+                    if (intervals && intervals.length > 0) {
+                        intervalSnapshot.set(spanId, intervals.slice());
+                    }
+                }
+                stampSelfDurationAndMetrics(spans, intervalSnapshot, this.selfDurationHistogram);
+            }
+            this.exportSpans(spans);
         } finally {
             for (const span of spans) {
                 this.childIntervals.delete(span.spanContext().spanId);
             }
+        }
+    }
+
+    private clearTransactionTags(spans: ReadableSpan[]): void {
+        for (const span of spans) {
+            delete span.attributes[CoralogixAttributes.TRANSACTION_IDENTIFIER];
+            delete span.attributes[CoralogixAttributes.TRANSACTION_ROOT];
         }
     }
 
