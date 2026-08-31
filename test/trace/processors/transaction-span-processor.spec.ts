@@ -231,7 +231,6 @@ export default describe('TransactionSpanProcessor', () => {
         const spans = exporter.getFinishedSpans();
         assert.strictEqual(spans.length, 260, 'large transactions must export every span');
         assert.ok(spans.every((span) => !(CoralogixAttributes.TRANSACTION_IDENTIFIER in span.attributes)));
-        assert.ok(spans.every((span) => !(CoralogixAttributes.TRANSACTION_ROOT in span.attributes)));
         assert.ok(spans.every((span) => !(CoralogixAttributes.SELF_DURATION in span.attributes)));
         assert.strictEqual(await selfDurationMetricPointCount(reader), 0);
 
@@ -252,7 +251,6 @@ export default describe('TransactionSpanProcessor', () => {
         const flushed = exporter.getFinishedSpans();
         assert.strictEqual(flushed.length, 257);
         assert.ok(flushed.every((span) => !(CoralogixAttributes.TRANSACTION_IDENTIFIER in span.attributes)));
-        assert.ok(flushed.every((span) => !(CoralogixAttributes.TRANSACTION_ROOT in span.attributes)));
         assert.ok(flushed.every((span) => !(CoralogixAttributes.SELF_DURATION in span.attributes)));
         assert.strictEqual(await selfDurationMetricPointCount(reader), 0);
 
@@ -276,7 +274,6 @@ export default describe('TransactionSpanProcessor', () => {
         const spans = exporter.getFinishedSpans();
         assert.strictEqual(spans.length, 4);
         assert.ok(spans.every((span) => !(CoralogixAttributes.TRANSACTION_IDENTIFIER in span.attributes)));
-        assert.ok(spans.every((span) => !(CoralogixAttributes.TRANSACTION_ROOT in span.attributes)));
         assert.ok(spans.every((span) => !(CoralogixAttributes.SELF_DURATION in span.attributes)));
         assert.strictEqual(await selfDurationMetricPointCount(reader), 0);
         await provider.shutdown();
@@ -300,7 +297,6 @@ export default describe('TransactionSpanProcessor', () => {
         const secondTrace = spans.filter((span) => span.name.startsWith('second'));
         assert.strictEqual(secondTrace.length, 2, spans.map((span) => span.name).join(','));
         assert.ok(secondTrace.every((span) => !(CoralogixAttributes.TRANSACTION_IDENTIFIER in span.attributes)));
-        assert.ok(secondTrace.every((span) => !(CoralogixAttributes.TRANSACTION_ROOT in span.attributes)));
         assert.ok(secondTrace.every((span) => !(CoralogixAttributes.SELF_DURATION in span.attributes)));
         assert.strictEqual(await selfDurationMetricPointCount(reader), 2);
         await provider.shutdown();

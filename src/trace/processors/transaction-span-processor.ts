@@ -269,6 +269,8 @@ export class TransactionSpanProcessor implements SpanProcessor {
         this.buffers.clear();
         this.liveParents.clear();
         this.passthroughTraces.clear();
+        for (const timer of this.passthroughCleanup.values()) clearTimeout(timer);
+        this.passthroughCleanup.clear();
         await this.awaitPendingExports();
         this.exporterShutdown = true;
         this.membership.clear();
@@ -306,9 +308,9 @@ export class TransactionSpanProcessor implements SpanProcessor {
         this.passthroughTraces.add(traceId);
         this.buffers.delete(traceId);
         this.membership.clearTrace(traceId);
-        this.clearTransactionTags(spans);
         this.exportSpans(spans);
         for (const span of spans) this.childIntervals.delete(span.spanContext().spanId);
+        for (const spanId of this.liveParents.get(traceId)?.keys() ?? []) this.childIntervals.delete(spanId);
         if (!this.liveParents.has(traceId)) this.schedulePassthroughCleanup(traceId);
     }
 
@@ -321,8 +323,8 @@ export class TransactionSpanProcessor implements SpanProcessor {
             live.delete(span.spanContext().spanId);
             if (live.size === 0) this.liveParents.delete(traceId);
         }
-        this.clearTransactionTags([span]);
         this.exportSpans([span]);
+        this.childIntervals.delete(span.spanContext().spanId);
         if (!this.liveParents.has(traceId)) this.schedulePassthroughCleanup(traceId);
     }
 
@@ -509,7 +511,6 @@ export class TransactionSpanProcessor implements SpanProcessor {
     private acceptCompleted(spans: ReadableSpan[]): void {
         try {
             if (spans.length > this.maxTransactionSpans) {
-                this.clearTransactionTags(spans);
                 this.exportSpans(spans);
                 return;
             }
