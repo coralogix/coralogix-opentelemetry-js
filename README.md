@@ -7,7 +7,7 @@
   </a>
 </p>
 
-# coralogix-opentelemetry-js
+# OpenTelemetry Node SDK Extensions
 
 [![CI](https://github.com/coralogix/coralogix-opentelemetry-js/actions/workflows/ci.yml/badge.svg)](https://github.com/coralogix/coralogix-opentelemetry-js/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/@coralogix/opentelemetry.svg)](https://www.npmjs.com/package/@coralogix/opentelemetry)
