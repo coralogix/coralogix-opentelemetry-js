@@ -30,7 +30,7 @@ export interface TransactionSpanProcessorOptions {
      * Env: `OTEL_CX_TRANSACTION_COMPLETION_HOLDBACK_MILLIS`.
      */
     completionHoldbackMillis?: number;
-    /** Maximum spans buffered for one trace. Env: `CORALOGIX_MAX_TRANSACTION_SPANS`. */
+    /** Maximum spans buffered for one trace. Env: `CORALOGIX_MAX_SPANS_PER_TRACE`. */
     maxTransactionSpans?: number;
     /** Maximum transactions retained in memory. Env: `CORALOGIX_MAX_TRANSACTION_TRACES`. */
     maxTraces?: number;

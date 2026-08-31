@@ -75,7 +75,7 @@ When a span starts a transaction, the sampler adds the following attributes:
 Transaction **membership** (new vs inherit, and `cgx.transaction.root`) is decided on span start. The display name `cgx.transaction` is stamped only when a completed local trace is finalized for export, using `overrideName ?? rootSpan.name`. That matters for Express: the HTTP span often starts as `GET` and is later renamed to `GET /myroute` by middleware — the exported transaction name is the final root span name.
 
 Every completed local trace is exported immediately. The processor buffers up
-to `CORALOGIX_MAX_TRANSACTION_SPANS` completed spans for transaction enrichment
+to `CORALOGIX_MAX_SPANS_PER_TRACE` completed spans for transaction enrichment
 (default: 256), and up to `CORALOGIX_MAX_TRANSACTION_TRACES` transactions retained in memory at once (default: unlimited).
 When a trace exceeds its span limit, it immediately exports that trace's buffer
 and streams later spans unchanged. When the trace limit is reached, later traces
