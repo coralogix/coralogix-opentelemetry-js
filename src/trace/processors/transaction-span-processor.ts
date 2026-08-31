@@ -9,7 +9,7 @@ import {
 } from "@opentelemetry/api";
 import {ReadableSpan, Span, SpanExporter, SpanProcessor} from "@opentelemetry/sdk-trace-base";
 import {CoralogixAttributes, METRIC_SELF_DURATION} from "../common";
-import {DEFAULT_SHUTDOWN_IDLE_WAIT_MILLIS, MAX_SELF_DURATION_SPANS} from "./defaults";
+import {DEFAULT_SHUTDOWN_IDLE_WAIT_MILLIS} from "./defaults";
 import {resolveProcessorOptions} from "./env-options";
 import {stampSelfDurationAndMetrics} from "./self-duration-stamp";
 import {
@@ -30,6 +30,10 @@ export interface TransactionSpanProcessorOptions {
      * Env: `OTEL_CX_TRANSACTION_COMPLETION_HOLDBACK_MILLIS`.
      */
     completionHoldbackMillis?: number;
+    /** Maximum spans buffered for one trace. Env: `CORALOGIX_MAX_TRANSACTION_SPANS`. */
+    maxTransactionSpans?: number;
+    /** Maximum transactions retained in memory. Env: `CORALOGIX_MAX_TRANSACTION_TRACES`. */
+    maxTraces?: number;
     /** How long shutdown waits for in-flight spans. Default 30_000. */
     shutdownIdleWaitMillis?: number;
 }
@@ -62,6 +66,8 @@ export class TransactionSpanProcessor implements SpanProcessor {
     private readonly membership = new TransactionMembershipTracker();
     private readonly selfDurationHistogram: Histogram;
     private readonly completionHoldbackMillis: number;
+    private readonly maxTransactionSpans: number;
+    private readonly maxTraces: number;
     private readonly shutdownIdleWaitMillis: number;
     /** traceId -> holdback timer after last live span ended */
     private readonly pendingCompletions = new Map<string, ReturnType<typeof setTimeout>>();
@@ -81,6 +87,8 @@ export class TransactionSpanProcessor implements SpanProcessor {
         this.exporter = exporter;
         const resolved = resolveProcessorOptions(options);
         this.completionHoldbackMillis = resolved.completionHoldbackMillis;
+        this.maxTransactionSpans = resolved.maxTransactionSpans;
+        this.maxTraces = resolved.maxTraces;
         this.shutdownIdleWaitMillis = options.shutdownIdleWaitMillis ?? DEFAULT_SHUTDOWN_IDLE_WAIT_MILLIS;
         const meter = (options.meterProvider ?? metrics.getMeterProvider()).getMeter(INSTRUMENTATION_SCOPE_NAME);
         this.selfDurationHistogram = meter.createHistogram(METRIC_SELF_DURATION, {
@@ -99,6 +107,15 @@ export class TransactionSpanProcessor implements SpanProcessor {
         }
 
         const {traceId, spanId} = span.spanContext();
+        if (
+            this.maxTraces > 0
+            && !this.passthroughTraces.has(traceId)
+            && !this.liveParents.has(traceId)
+            && !this.buffers.has(traceId)
+            && this.bufferedTraceCount() >= this.maxTraces
+        ) {
+            this.passthroughTraces.add(traceId);
+        }
         if (!this.passthroughTraces.has(traceId)) try {
             this.membership.trackOnStart(span, parentContext);
         } catch (error) {
@@ -151,7 +168,12 @@ export class TransactionSpanProcessor implements SpanProcessor {
         }
 
         const parentId = span.parentSpanContext?.spanId;
-        const buffer = this.buffers.get(traceId) ?? [];
+        const existingBuffer = this.buffers.get(traceId);
+        if (this.maxTraces > 0 && !existingBuffer && !live && this.bufferedTraceCount() >= this.maxTraces) {
+            this.enterPassthrough(traceId, [span]);
+            return;
+        }
+        const buffer = existingBuffer ?? [];
         // Only retain intervals for parents we track locally. Remote / external
         // parent IDs are never cleaned by acceptCompleted and would leak.
         if (parentId && this.isLocalParent(parentId, live, buffer)) {
@@ -173,7 +195,7 @@ export class TransactionSpanProcessor implements SpanProcessor {
             }
         }
 
-        if (buffer.length > MAX_SELF_DURATION_SPANS) {
+        if (buffer.length > this.maxTransactionSpans) {
             this.enterPassthrough(traceId, buffer);
             return;
         }
@@ -470,6 +492,15 @@ export class TransactionSpanProcessor implements SpanProcessor {
         return n;
     }
 
+    private bufferedTraceCount(): number {
+        const traceIds = new Set([...this.liveParents.keys(), ...this.buffers.keys()]);
+        let count = 0;
+        for (const traceId of traceIds) {
+            if (!this.passthroughTraces.has(traceId)) count += 1;
+        }
+        return count;
+    }
+
     /**
      * Export finalize for one completed local transaction batch:
      * 1) enrich batches up to 256 spans with transaction names and self duration
@@ -477,7 +508,7 @@ export class TransactionSpanProcessor implements SpanProcessor {
      */
     private acceptCompleted(spans: ReadableSpan[]): void {
         try {
-            if (spans.length > MAX_SELF_DURATION_SPANS) {
+            if (spans.length > this.maxTransactionSpans) {
                 this.clearTransactionTags(spans);
                 this.exportSpans(spans);
                 return;
