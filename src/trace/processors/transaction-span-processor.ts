@@ -308,7 +308,7 @@ export class TransactionSpanProcessor implements SpanProcessor {
         this.passthroughTraces.add(traceId);
         this.buffers.delete(traceId);
         this.membership.clearTrace(traceId);
-        this.exportSpans(spans);
+        this.exportRawSpans(spans);
         for (const span of spans) this.childIntervals.delete(span.spanContext().spanId);
         for (const spanId of this.liveParents.get(traceId)?.keys() ?? []) this.childIntervals.delete(spanId);
         if (!this.liveParents.has(traceId)) this.schedulePassthroughCleanup(traceId);
@@ -323,7 +323,7 @@ export class TransactionSpanProcessor implements SpanProcessor {
             live.delete(span.spanContext().spanId);
             if (live.size === 0) this.liveParents.delete(traceId);
         }
-        this.exportSpans([span]);
+        this.exportRawSpans([span]);
         this.childIntervals.delete(span.spanContext().spanId);
         if (!this.liveParents.has(traceId)) this.schedulePassthroughCleanup(traceId);
     }
@@ -543,6 +543,19 @@ export class TransactionSpanProcessor implements SpanProcessor {
 
     private exportSpans(spans: ReadableSpan[]): void {
         void this.exportSpansAsync(spans);
+    }
+
+    // Raw passthrough must not create one processor-owned Promise per span.
+    // The downstream exporter owns its own batching/backpressure.
+    private exportRawSpans(spans: ReadableSpan[]): void {
+        if (spans.length === 0 || this.exporterShutdown) return;
+        try {
+            this.exporter.export(spans, (result) => {
+                if (result.error) diag.warn("TransactionSpanProcessor: raw span export failed", result.error);
+            });
+        } catch (error) {
+            diag.error("TransactionSpanProcessor raw passthrough export failed", error);
+        }
     }
 
     private async exportSpansAsync(spans: ReadableSpan[]): Promise<void> {
