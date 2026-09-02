@@ -77,6 +77,10 @@ export class TransactionSpanProcessor implements SpanProcessor {
     private readonly childIntervals = new Map<string, Array<{startNs: bigint; endNs: bigint}>>();
     /** In-flight exporter.export promises; forceFlush/shutdown wait for these. */
     private readonly pendingExports = new Set<Promise<void>>();
+    /** Raw exporter callbacks not represented by the serialized export chain. */
+    private pendingRawExports = 0;
+    private rawExportsDrained: Promise<void> | undefined;
+    private resolveRawExportsDrained: (() => void) | undefined;
     /** Serializes exporter.export so at most one call is in flight. */
     private exportChain: Promise<void> = Promise.resolve();
     private stopped = false;
@@ -549,12 +553,26 @@ export class TransactionSpanProcessor implements SpanProcessor {
     // The downstream exporter owns its own batching/backpressure.
     private exportRawSpans(spans: ReadableSpan[]): void {
         if (spans.length === 0 || this.exporterShutdown) return;
+        this.pendingRawExports += 1;
+        let completed = false;
+        const complete = (): void => {
+            if (completed) return;
+            completed = true;
+            this.pendingRawExports -= 1;
+            if (this.pendingRawExports === 0) {
+                this.resolveRawExportsDrained?.();
+                this.rawExportsDrained = undefined;
+                this.resolveRawExportsDrained = undefined;
+            }
+        };
         try {
             this.exporter.export(spans, (result) => {
                 if (result.error) diag.warn("TransactionSpanProcessor: raw span export failed", result.error);
+                complete();
             });
         } catch (error) {
             diag.error("TransactionSpanProcessor raw passthrough export failed", error);
+            complete();
         }
     }
 
@@ -602,9 +620,20 @@ export class TransactionSpanProcessor implements SpanProcessor {
     }
 
     private async awaitPendingExports(): Promise<void> {
-        while (this.pendingExports.size > 0) {
+        while (this.pendingExports.size > 0 || this.pendingRawExports > 0) {
             await Promise.all([...this.pendingExports]);
+            await this.awaitPendingRawExports();
         }
+    }
+
+    private async awaitPendingRawExports(): Promise<void> {
+        if (this.pendingRawExports === 0) return Promise.resolve();
+        if (!this.rawExportsDrained) {
+            this.rawExportsDrained = new Promise((resolve) => {
+                this.resolveRawExportsDrained = resolve;
+            });
+        }
+        return this.rawExportsDrained;
     }
 }
 
