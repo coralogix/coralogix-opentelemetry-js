@@ -261,6 +261,37 @@ export default describe('TransactionSpanProcessor', () => {
         await meterProvider.shutdown();
     });
 
+    it('waits for raw exports before shutdown', async () => {
+        const callbacks: Array<() => void> = [];
+        let exporterShutdown = false;
+        const exporter: SpanExporter = {
+            export(_spans, callback): void {
+                callbacks.push(() => callback({code: ExportResultCode.SUCCESS}));
+            },
+            async shutdown(): Promise<void> {
+                exporterShutdown = true;
+            },
+        };
+        const provider = new BasicTracerProvider({
+            spanProcessors: [new TransactionSpanProcessor(exporter, {maxTransactionSpans: 2})],
+        });
+        const tracer = provider.getTracer('test');
+        const root = tracer.startSpan('large transaction', {kind: SpanKind.SERVER});
+        const context = opentelemetry.trace.setSpan(ROOT_CONTEXT, root);
+        for (let index = 0; index < 3; index++) {
+            const child = tracer.startSpan(`child-${index}`, {}, context);
+            child.end();
+        }
+        root.end();
+
+        const shutdown = provider.shutdown();
+        await sleep(0);
+        assert.strictEqual(exporterShutdown, false, 'shutdown must wait for raw export callbacks');
+        callbacks.forEach((callback) => callback());
+        await shutdown;
+        assert.strictEqual(exporterShutdown, true);
+    });
+
     it('uses maxTransactionSpans for the raw passthrough cutoff', async () => {
         const {provider, tracer, exporter, reader, meterProvider} = buildProvider({maxTransactionSpans: 2});
         const root = tracer.startSpan('limited transaction', {kind: SpanKind.SERVER});
