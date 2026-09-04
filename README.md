@@ -77,8 +77,9 @@ Transaction **membership** (new vs inherit, and `cgx.transaction.root`) is decid
 Every completed local trace is exported immediately. The processor buffers up
 to `CORALOGIX_MAX_SPANS_PER_TRACE` completed spans for transaction enrichment
 (default: 256), and up to `CORALOGIX_MAX_TRANSACTION_TRACES` transactions retained in memory at once (default: unlimited).
-When a trace exceeds its span limit, it immediately exports that trace's buffer
-and streams later spans unchanged. When the trace limit is reached, later traces
+When a positive span limit is exceeded, it immediately exports that trace's buffer
+and streams later spans unchanged. `CORALOGIX_MAX_SPANS_PER_TRACE=0` is unlimited.
+When the trace limit is reached, later traces
 stream unchanged. The trace limit applies only while transactions are retained in memory; `0` is unlimited, and once a buffered transaction finishes, capacity is available again. Those traces receive no processor transaction tags,
 self-duration, or metrics.
 
