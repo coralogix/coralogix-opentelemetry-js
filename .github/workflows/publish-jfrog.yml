@@ -55,8 +55,26 @@ jobs:
             exit 1
           fi
       - run: npm prune dev
-      - run: curl -u "${ARTIFACTORY_USERNAME}:${ARTIFACTORY_PASSWORD}" https://cgx.jfrog.io/artifactory/api/npm/internal.npm.coralogix.net/auth/coralogix | tee ~/.npmrc
+      - name: Authenticate to the internal npm registry
+        # /api/npm/<repo>/auth/<scope> returns a basic-auth npmrc: username=,
+        # _password=, email=. An OIDC token authenticates as a transient identity
+        # that has no username, so Artifactory cannot fill that field in and answers
+        #   422 {"errors":[{"status":422,"message":"User must have a username"}]}
+        # The trailing path segment is the npm scope, not a user - it plays no part
+        # in the failure.
+        #
+        # _authToken is a bearer credential and needs no username, which is exactly
+        # what the 422 says is missing. Same approach internal-staghorn uses.
+        #
+        # @coralogix:registry is kept because `npm publish` below resolves the
+        # publish target for @coralogix/opentelemetry through it. always-auth is
+        # not carried over: npm removed it in v9 and only warns about it now.
+        run: |
+          umask 077
+          cat >> "$HOME/.npmrc" <<NPMRC
+          @coralogix:registry=https://cgx.jfrog.io/artifactory/api/npm/internal.npm.coralogix.net/
+          //cgx.jfrog.io/artifactory/api/npm/internal.npm.coralogix.net/:_authToken=${JFROG_TOKEN}
+          NPMRC
         env:
-          ARTIFACTORY_USERNAME: ${{ steps.jfrog.outputs.oidc-user }}
-          ARTIFACTORY_PASSWORD: ${{ steps.jfrog.outputs.oidc-token }}
+          JFROG_TOKEN: ${{ steps.jfrog.outputs.oidc-token }}
       - run: npm publish --userconfig ~/.npmrc
