@@ -106,6 +106,33 @@ Constructor options win over environment variables. Invalid env values fall back
 | `shutdownIdleWaitMillis` | `number` | `30000` | — | How long shutdown waits for in-flight spans. |
 | `meterProvider` | `MeterProvider` | global | — | MeterProvider for the self-duration histogram. |
 
+## Benchmark
+
+To help users estimate resource usage, we ran this benchmark. The first table processes 10,000 traces at each depth from 8 to 2,048 spans to show the impact of increasingly deep transactions. The second table processes traces with a depth of 1,000 spans at increasing trace counts to show the effect of transaction volume.
+
+### 10000 traces by depth
+
+| Depth | Traces | RSS base MiB | RSS peak MiB | RSS delta MiB | Spans/s |
+|---:|---:|---:|---:|---:|---:|
+|  8  |  10000  | 92.00 | 261.90 | 169.90 | 80796.10 |
+|  16  |  10000  | 92.50 | 274.00 | 181.50 | 122777.50 |
+|  32  |  10000  | 92.20 | 278.50 | 186.40 | 137156.90 |
+|  64  |  10000  | 92.40 | 272.60 | 180.20 | 135673.80 |
+|  128  |  10000  | 92.50 | 269.50 | 177.00 | 111464.50 |
+|  256  |  10000  | 93.20 | 266.80 | 173.60 | 71862.90 |
+|  512  |  10000  | 92.80 | 265.30 | 172.50 | 124391.00 |
+|  1024  |  10000  | 92.50 | 267.90 | 175.40 | 132568.20 |
+|  2048  |  10000  | 92.50 | 300.30 | 207.80 | 132028.60 |
+
+### Depth 1000 by trace count
+
+| Depth | Traces | RSS base MiB | RSS peak MiB | RSS delta MiB | Spans/s |
+|---:|---:|---:|---:|---:|---:|
+|  1000  |  100  | 92.30 | 215.00 | 122.70 | 124250.30 |
+|  1000  |  1000  | 92.70 | 219.20 | 126.50 | 131300.10 |
+|  1000  |  10000  | 92.10 | 277.30 | 185.10 | 131087.30 |
+|  1000  |  100000  | 92.40 | 276.10 | 183.70 | 133746.70 |
+
 ## Transactions with Express
 
 To resolve stable, low-cardinality transaction names for Express routes (e.g. `GET /users/:id` instead of a per-request path), call `setExpressApp` so the sampler can learn your app's routes and endpoints.
