@@ -22,7 +22,21 @@ jobs:
   publish-npm:
     needs: test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC token for the JFrog exchange
     steps:
+      - name: Set up JFrog CLI
+        # Exchanges this job's GitHub OIDC JWT for a short-lived Artifactory token.
+        # Replaces the JFROG_USER / JFROG_PASSWORD secret pair. The action calls
+        # core.setSecret() on both outputs, so they stay masked in the log.
+        id: jfrog
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_URL: https://cgx.jfrog.io
+        with:
+          oidc-provider-name: github
+          oidc-audience: jfrog-github
       - uses: actions/checkout@v3
       - uses: actions/setup-node@v3
         with:
@@ -43,6 +57,6 @@ jobs:
       - run: npm prune dev
       - run: curl -u "${ARTIFACTORY_USERNAME}:${ARTIFACTORY_PASSWORD}" https://cgx.jfrog.io/artifactory/api/npm/internal.npm.coralogix.net/auth/coralogix | tee ~/.npmrc
         env:
-          ARTIFACTORY_USERNAME: ${{ secrets.JFROG_USER }}
-          ARTIFACTORY_PASSWORD: ${{ secrets.JFROG_PASSWORD }}
+          ARTIFACTORY_USERNAME: ${{ steps.jfrog.outputs.oidc-user }}
+          ARTIFACTORY_PASSWORD: ${{ steps.jfrog.outputs.oidc-token }}
       - run: npm publish --userconfig ~/.npmrc
