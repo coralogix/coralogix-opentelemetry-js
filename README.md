@@ -1,7 +1,19 @@
-# coralogix-opentelemetry-js
+<p align="center">
+  <a href="https://coralogix.com/?utm_source=oss_platforms&utm_medium=referral&utm_campaign=oss_presence&utm_content=readme_badge">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset=".github/assets/coralogix-logo-dark.svg">
+      <img alt="Coralogix" src=".github/assets/coralogix-logo-light.svg" width="180">
+    </picture>
+  </a>
+</p>
 
+# OpenTelemetry Node SDK Extensions
+
+[![CI](https://github.com/coralogix/coralogix-opentelemetry-js/actions/workflows/ci.yml/badge.svg)](https://github.com/coralogix/coralogix-opentelemetry-js/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/@coralogix/opentelemetry.svg)](https://www.npmjs.com/package/@coralogix/opentelemetry)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
+
+-----
 
 Coralogix extensions for the [OpenTelemetry Node SDK](https://github.com/open-telemetry/opentelemetry-js). This package adds Coralogix-specific behavior on top of a standard OpenTelemetry tracing setup — transaction tagging via a sampler and/or a `SpanProcessor`, including exclusive self duration on the processor path.
 
