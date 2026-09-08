@@ -311,6 +311,24 @@ export default describe('TransactionSpanProcessor', () => {
         await meterProvider.shutdown();
     });
 
+    it('treats a zero maxTransactionSpans limit as unlimited', async () => {
+        const {provider, tracer, exporter, reader, meterProvider} = buildProvider({maxTransactionSpans: 0});
+        const root = tracer.startSpan('unlimited transaction', {kind: SpanKind.SERVER});
+        const context = opentelemetry.trace.setSpan(ROOT_CONTEXT, root);
+        for (let index = 0; index < 256; index++) {
+            tracer.startSpan(`child-${index}`, {}, context).end();
+        }
+        root.end();
+        await provider.forceFlush();
+        const spans = exporter.getFinishedSpans();
+        assert.strictEqual(spans.length, 257);
+        assert.ok(spans.every((span) => CoralogixAttributes.TRANSACTION_IDENTIFIER in span.attributes));
+        assert.ok(spans.every((span) => CoralogixAttributes.SELF_DURATION in span.attributes));
+        assert.strictEqual(await selfDurationMetricPointCount(reader), 257);
+        await provider.shutdown();
+        await meterProvider.shutdown();
+    });
+
     it('uses maxTraces to pass through traces beyond the buffer capacity', async () => {
         const {provider, tracer, exporter, reader, meterProvider} = buildProvider({maxTraces: 1});
         const first = tracer.startSpan('first', {kind: SpanKind.SERVER});

@@ -199,7 +199,7 @@ export class TransactionSpanProcessor implements SpanProcessor {
             }
         }
 
-        if (buffer.length > this.maxTransactionSpans) {
+        if (this.maxTransactionSpans > 0 && buffer.length > this.maxTransactionSpans) {
             this.enterPassthrough(traceId, buffer);
             return;
         }
@@ -514,7 +514,7 @@ export class TransactionSpanProcessor implements SpanProcessor {
      */
     private acceptCompleted(spans: ReadableSpan[]): void {
         try {
-            if (spans.length > this.maxTransactionSpans) {
+            if (this.maxTransactionSpans > 0 && spans.length > this.maxTransactionSpans) {
                 this.exportSpans(spans);
                 return;
             }
