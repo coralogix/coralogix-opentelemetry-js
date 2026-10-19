@@ -29,6 +29,7 @@ This package relies on your application's existing OpenTelemetry setup. The foll
 | --- | --- |
 | `@opentelemetry/api` | `^1.7.0` |
 | `@opentelemetry/sdk-trace-base` | `^2.8.0` |
+| `@opentelemetry/sdk-logs` (optional, only for `ContextLinesProcessor`) | `>=0.203.0 <0.300.0` |
 
 The examples below also use `@opentelemetry/resources` and `@opentelemetry/semantic-conventions`, which are part of a typical OpenTelemetry Node setup.
 
@@ -117,6 +118,56 @@ Constructor options win over environment variables. Invalid env values fall back
 | `completionHoldbackMillis` | `number` | `100` | `OTEL_CX_TRANSACTION_COMPLETION_HOLDBACK_MILLIS` | After the last live span ends, wait this long before finalize so late siblings can join. `0` = finalize immediately. |
 | `shutdownIdleWaitMillis` | `number` | `30000` | — | How long shutdown waits for in-flight spans. |
 | `meterProvider` | `MeterProvider` | global | — | MeterProvider for the self-duration histogram. |
+
+## Source context lines for error logs
+
+`ContextLinesProcessor` is an OpenTelemetry `LogRecordProcessor`. For every log record that carries a Node.js `exception.stacktrace`, it reads the source files of the in-app frames and sets `cx.exception.context_lines`: a JSON string with the lines around each frame (`pre_context`, `context_line`, `post_context`). It never throws and never modifies the stacktrace.
+
+It must be registered **before** the processor that exports, in a `LoggerProvider` that receives your error logs. A full batch exports inside its own `onEmit`, and records become read-only once the last `onEmit` returns.
+
+```js
+import { LoggerProvider, BatchLogRecordProcessor } from "@opentelemetry/sdk-logs";
+import { OTLPLogExporter } from "@opentelemetry/exporter-logs-otlp-http";
+import { ContextLinesProcessor } from "@coralogix/opentelemetry";
+
+const errorLoggerProvider = new LoggerProvider({
+    processors: [
+        new ContextLinesProcessor({ linesOfContext: 7 }),
+        new BatchLogRecordProcessor(new OTLPLogExporter({ url: "<your-endpoint>" })),
+    ],
+});
+
+errorLoggerProvider.getLogger("errors").emit({
+    body: err.message,
+    attributes: { "exception.stacktrace": err.stack },
+});
+```
+
+Each element of the attribute is one frame:
+
+```json
+{
+  "index": 0,
+  "filename": "/app/src/handler.ts",
+  "function": "handle",
+  "lineno": 42,
+  "colno": 11,
+  "in_app": true,
+  "pre_context": ["..."],
+  "context_line": "throw new Error(reason);",
+  "post_context": ["}"]
+}
+```
+
+When the frame was mapped through a source map, `filename`, `lineno` and `colno` point at the original source and `generated` holds the position in the executed file.
+
+### Requirements and limits
+
+- The process must be able to read the source files named in the stacktrace, or a source map with `sourcesContent`, from disk at runtime. Containers that ship only compiled output without sources or maps get no context.
+- Frames under `node_modules`, `node:` internals and non-absolute paths are skipped.
+- Minified files (line number over 10,000 or column over 1,000) are skipped.
+- With `--enable-source-maps` the runtime already reports original positions and they are used as is. Without it, compiled JavaScript frames are mapped through the file's `sourceMappingURL` (external or inline map). Frames in `.ts` files, such as under `tsx`, are used as is.
+- The processor is Node.js only. Output is bounded: 50 frames, 7 lines of context, 150 characters per line, 32 KiB for the attribute, files over 1 MiB ignored. All are constructor options (`maxFrames`, `linesOfContext`, `maxLineLength`, `maxAttributeBytes`, `maxFileBytes`, `cacheSize`).
 
 ## Transactions with Express
 
