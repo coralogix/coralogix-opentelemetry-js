@@ -174,6 +174,46 @@ Both **Express 4** and **Express 5** are supported.
 
 Parameters are templatized correctly on both versions, including a parameter used in a *mount prefix* (`app.use("/v/:ver", router)`): a request to `/v/2/things/abc` resolves to `GET /v/:ver/things/:t`.
 
+## Pathways (experimental)
+
+Pathways report exact, pre-sampling metrics for every root-to-leaf chain of services in a distributed trace, without a collector gateway. `CoralogixPathwaySampler` carries the pathway identity in `tracestate`; `PathwayMetricsSpanProcessor` records the metrics in each process.
+
+```js
+import { CoralogixPathwaySampler, CoralogixTransactionSampler, PathwayMetricsSpanProcessor } from "@coralogix/opentelemetry";
+
+const tracerProvider = new BasicTracerProvider({
+    resource: resourceFromAttributes({ [ATTR_SERVICE_NAME]: "checkout" }),
+    sampler: new CoralogixPathwaySampler({
+        serviceName: "checkout",
+        delegate: new CoralogixTransactionSampler(),
+    }),
+    spanProcessors: [new PathwayMetricsSpanProcessor(), yourExportingProcessor],
+});
+```
+
+Every service entry (a span with no parent or a remote parent) becomes a node. Its pathway id is `fnv1a64(parentPathwayId | service.name)`, so the same service gets a different id under each upstream chain. A service calling itself does not add a node, and hops beyond `maxDepth` (default 10) fold into the last kept node.
+
+Propagated `tracestate` members:
+
+| Member | Value |
+| --- | --- |
+| `cgx_pw_root` | Root service of the pathway |
+| `cgx_pw_tx` | Root transaction name |
+| `cgx_pw_caller` | Service that made the call |
+| `cgx_pw_id` | Pathway id of the calling node (16 hex chars) |
+| `cgx_pw_depth` | Depth of the calling node |
+
+Metrics:
+
+| Metric | Recorded on | Attributes |
+| --- | --- | --- |
+| `cgx.pathway.hop.duration` (s) | Each service entry span | root service and transaction, caller, `service_name`, pathway id, parent id, depth, error |
+| `cgx.pathway.outbound.duration` (s) | `CLIENT` / `PRODUCER` spans | root service and transaction, `service_name`, destination, destination type (`database`, `messaging`, `remote`), pathway id, error |
+| `cgx.pathway.duration` (s) | The pathway root span | root service and transaction, error |
+| `cgx.pathway.info` (gauge) | Each admitted pathway id | pathway id, parent id, `service_name`, depth; rebuilds the readable chain |
+
+Each process admits at most `maxPathwaysPerRoot` (default 50) pathway ids per root service; the rest are recorded under the `overflow` id, so counts stay exact.
+
 ## Changelog
 
 See [CHANGELOG.md](./CHANGELOG.md) for release notes. Note that route-template resolution for prefixed and nested routers is a **breaking output change**: transaction names for affected apps change, so update any dashboards, alerts, or saved views keyed on the previous names.
