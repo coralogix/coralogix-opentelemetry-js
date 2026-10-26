@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- `ContextLinesProcessor`: a `LogRecordProcessor` that reads `exception.stacktrace` on a log
+  record and sets `cx.exception.context_lines`, a JSON string with the surrounding source lines
+  of each in-app frame. It maps compiled frames through source maps, skips `node_modules` and
+  minified files, and never throws. Needs the peer dependency
+  `@opentelemetry/sdk-logs` (`>=0.203.0 <0.300.0`, optional).
+
 ## [0.5.0] - 2026-08-26
 
 ### Added
