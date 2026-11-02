@@ -1,4 +1,5 @@
-import {describe, it} from "node:test";
+import {after, before, describe, it} from "node:test";
+import {AsyncLocalStorageContextManager} from "@opentelemetry/context-async-hooks";
 import assert from "node:assert";
 import {setTimeout as sleep} from "node:timers/promises";
 import * as opentelemetry from "@opentelemetry/api";
@@ -44,6 +45,28 @@ class StickySpanExporter implements SpanExporter {
     async shutdown(): Promise<void> {
         this.shut = true;
     }
+
+    getFinishedSpans(): ReadableSpan[] {
+        return this.spans.slice();
+    }
+}
+
+class SelfTracingSpanExporter implements SpanExporter {
+    tracer?: opentelemetry.Tracer;
+    recordingExportSpans = 0;
+    private spans: ReadableSpan[] = [];
+
+    export(spans: ReadableSpan[], resultCallback: (result: {code: ExportResultCode}) => void): void {
+        this.spans.push(...spans);
+        const exportSpan = this.tracer!.startSpan('*/Export', {kind: SpanKind.CLIENT});
+        if (exportSpan.isRecording()) this.recordingExportSpans += 1;
+        setImmediate(() => {
+            exportSpan.end();
+            resultCallback({code: ExportResultCode.SUCCESS});
+        });
+    }
+
+    async shutdown(): Promise<void> {}
 
     getFinishedSpans(): ReadableSpan[] {
         return this.spans.slice();
@@ -995,5 +1018,70 @@ export default describe('TransactionSpanProcessor', () => {
 
         await provider.shutdown();
         await meterProvider.shutdown();
+    });
+
+    describe('exporter self-instrumentation', () => {
+        const contextManager = new AsyncLocalStorageContextManager();
+
+        before(() => {
+            opentelemetry.context.setGlobalContextManager(contextManager.enable());
+        });
+
+        after(() => {
+            contextManager.disable();
+            opentelemetry.context.disable();
+        });
+
+        function buildSelfTracingProvider(options: ConstructorParameters<typeof TransactionSpanProcessor>[1] = {}) {
+            const exporter = new SelfTracingSpanExporter();
+            const meterProvider = new MeterProvider();
+            const provider = new BasicTracerProvider({
+                spanProcessors: [new TransactionSpanProcessor(exporter, {meterProvider, ...options})],
+            });
+            const tracer = provider.getTracer('test');
+            exporter.tracer = tracer;
+            return {provider, tracer, exporter, meterProvider};
+        }
+
+        async function endInsideOwnContext(tracer: opentelemetry.Tracer, name: string): Promise<void> {
+            const root = tracer.startSpan(name, {kind: SpanKind.SERVER}, ROOT_CONTEXT);
+            await opentelemetry.context.with(opentelemetry.trace.setSpan(ROOT_CONTEXT, root), async () => {
+                tracer.startSpan(`${name}-db`).end();
+                root.end();
+                await sleep(20);
+            });
+        }
+
+        it('does not trace transaction exports into the exported trace', async () => {
+            const {provider, tracer, exporter, meterProvider} = buildSelfTracingProvider();
+
+            await endInsideOwnContext(tracer, 'ListFavorites');
+            await sleep(50);
+            await provider.forceFlush();
+
+            const names = exporter.getFinishedSpans().map((span) => span.name).sort();
+            assert.deepStrictEqual(names, ['ListFavorites', 'ListFavorites-db']);
+            assert.strictEqual(exporter.recordingExportSpans, 0);
+
+            await provider.shutdown();
+            await meterProvider.shutdown();
+        });
+
+        it('does not trace raw passthrough exports into the exported trace', async () => {
+            const {provider, tracer, exporter, meterProvider} = buildSelfTracingProvider({maxTraces: 1});
+
+            const held = tracer.startSpan('held', {kind: SpanKind.SERVER}, ROOT_CONTEXT);
+            await endInsideOwnContext(tracer, 'overflow');
+            held.end();
+            await sleep(50);
+            await provider.forceFlush();
+
+            const names = exporter.getFinishedSpans().map((span) => span.name).sort();
+            assert.deepStrictEqual(names, ['held', 'overflow', 'overflow-db']);
+            assert.strictEqual(exporter.recordingExportSpans, 0);
+
+            await provider.shutdown();
+            await meterProvider.shutdown();
+        });
     });
 });

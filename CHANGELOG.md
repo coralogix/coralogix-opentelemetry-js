@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.5.1] - 2026-11-02
+
+### Fixed
+
+- `TransactionSpanProcessor` now exports with tracing suppressed and detached from the caller's
+  context. Previously an instrumented exporter (e.g. OTLP gRPC under `instrumentation-grpc`)
+  traced its own `Export` calls into the trace being exported, which re-triggered export in an
+  unbounded loop and drove CPU up linearly. `@opentelemetry/core` is now a peer dependency.
+
 ## [0.5.0] - 2026-08-26
 
 ### Added
