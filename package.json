@@ -1,6 +1,6 @@
 {
   "name": "@coralogix/opentelemetry",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "license": "Apache-2.0",
   "description": "Coralogix extensions for the OpenTelemetry Node SDK, including a transaction sampler for Coralogix APM.",
   "main": "dist/index.js",
@@ -25,11 +25,13 @@
   },
   "peerDependencies": {
     "@opentelemetry/api": "^1.7.0",
+    "@opentelemetry/core": "^2.8.0",
     "@opentelemetry/sdk-trace-base": "^2.8.0"
   },
   "devDependencies": {
     "@grpc/grpc-js": "^1.14.4",
     "@opentelemetry/api": "^1.7.0",
+    "@opentelemetry/context-async-hooks": "^2.12.0",
     "@opentelemetry/core": "^2.8.0",
     "@opentelemetry/exporter-metrics-otlp-grpc": "^0.208.0",
     "@opentelemetry/exporter-trace-otlp-grpc": "^0.208.0",

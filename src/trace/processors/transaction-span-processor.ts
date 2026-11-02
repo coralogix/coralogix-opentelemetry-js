@@ -1,12 +1,15 @@
 import {
     Context,
+    context,
     diag,
     Histogram,
     isSpanContextValid,
     MeterProvider,
     metrics,
+    ROOT_CONTEXT,
     trace,
 } from "@opentelemetry/api";
+import {ExportResult, suppressTracing} from "@opentelemetry/core";
 import {ReadableSpan, Span, SpanExporter, SpanProcessor} from "@opentelemetry/sdk-trace-base";
 import {CoralogixAttributes, METRIC_SELF_DURATION} from "../common";
 import {DEFAULT_SHUTDOWN_IDLE_WAIT_MILLIS} from "./defaults";
@@ -566,7 +569,7 @@ export class TransactionSpanProcessor implements SpanProcessor {
             }
         };
         try {
-            this.exporter.export(spans, (result) => {
+            this.exportUntraced(spans, (result) => {
                 if (result.error) diag.warn("TransactionSpanProcessor: raw span export failed", result.error);
                 complete();
             });
@@ -574,6 +577,10 @@ export class TransactionSpanProcessor implements SpanProcessor {
             diag.error("TransactionSpanProcessor raw passthrough export failed", error);
             complete();
         }
+    }
+
+    private exportUntraced(spans: ReadableSpan[], resultCallback: (result: ExportResult) => void): void {
+        context.with(suppressTracing(ROOT_CONTEXT), () => this.exporter.export(spans, resultCallback));
     }
 
     private async exportSpansAsync(spans: ReadableSpan[]): Promise<void> {
@@ -586,7 +593,7 @@ export class TransactionSpanProcessor implements SpanProcessor {
             }
             await new Promise<void>((resolve) => {
                 try {
-                    this.exporter.export(spans, (result) => {
+                    this.exportUntraced(spans, (result) => {
                         if (result.error) {
                             diag.warn("TransactionSpanProcessor: span export failed", result.error);
                         }
